@@ -1,0 +1,1462 @@
+# 冷链货物追责服务
+
+面向冷链货物追责的后端服务：录入货物与**自有测温 / 交接事件**、**冷链车次、每票货物的装卸时段与车载测温读数**，在**合并读数时间线**上按发生时间重建保管链，自动识别越温区间并在交接时刻拆分责任。技术栈 **Python 3.11 + FastAPI + SQLAlchemy 2 + PostgreSQL**。
+
+车载测温（本轮）：同一冷链车承载多票货物时，可登记车次、每票货物的装卸时段（左闭右开）与车载探头读数；车载读数仅作用于读数时刻仍在车上的货物，并按**各自温度上限**判断越温；同刻有货物自有测温时**优先采用自有值**（车载原始读数仍可查）；交接仍只由货物自有事件改变保管方。质控接口 `GET /trips/{trip_id}/simultaneous-excursions` 按带时区查询窗返回同一车次上**多票货物同时越温**的时段（数量门槛 `min_cargo≥2`，货物集合变化即分段）。
+
+测温值更正（本轮）：测温录错后，可凭**自有测温事件ID 或车载读数ID**（配合 `target_type` 与 `target_id`）、**更正ID**、**期望版本** `expected_version` 与**新温度**提交更正。更正**只改温度**——测温时刻、货物 / 车次归属与原始编号均不变，**交接不可更正**。原始测温 / 读数永不修改，更正只追加（append-only）；原始记录查询的 `temperature` 仍是原值，另显示 `effective_temperature` 与 `version`（0=原始，n=第 n 次更正后的有效值），原始记录及历次更正均可查。货物时间线、越温报告、责任确认与车次同时越温查询一律**按有效值重建**；同刻自有测温优先与装卸时段左闭右开规则继续适用；车载读数更正**同时影响读数时刻在车的全部货物**。原事件 / 原读数按原内容重传仍幂等；更正ID同内容重传返回原结果、异内容冲突；期望版本过期、目标不存在或目标为交接均拒绝且不落部分结果。更正与相关事件、责任表态及装卸登记经行锁串行；历史表态保留，其当前有效性按重建后的责任片段判断。
+
+装卸前预检（本轮）：登记车次装卸时段前，可对一批待装货物做**温控兼容性预检**——输入车次、各票货物及左闭右开装卸时段与**预期车次修订号**，预检按“既有装卸 ∪ 本批拟登记”输出各重叠时段的货物集合、温度上限差异、已有车载读数覆盖与潜在越温风险，**只读不写入装卸记录**，并返回绑定车次修订号、涉及货物温度上限与车次读数版本的**预检摘要**。确认登记须携带该摘要：服务端在持锁事务内重算摘要，发现车次、货物或读数版本变化即拒绝过期摘要；通过后沿用现有批量原子校验，任一时段冲突整批不落库。车次维护单调递增的**修订号**（装卸登记 / 车载读数写入 / 车载读数更正使其 +1），车次查询接口可见。
+
+装卸时段更正（本轮）：装卸时段录错后，调度员可凭**更正编号**、**原车次 + 货物 + 首次登记装车时刻**（被更正窗口的稳定身份）、**期望版本**、**修正后的带时区装卸时刻**与**原因**更正已有登记。更正**只改这一条装卸窗口**——车次 / 货物归属与稳定身份永不改变；**原窗口和历次更正可追溯**（append-only），车次详情展示**当前窗口**。新时段仍**左闭右开**且起点严格早于终点，重叠校验按“同一货物在**任意车次**的当前时段不得重叠”进行并**排除该条旧窗口本身**，冲突整次拒绝、不留部分变更。更正后**车载读数适用性按当前窗口重算**（恰在装车时刻纳入、卸车时刻排除），晚到读数、同刻自有测温优先与更正后有效温度规则继续适用；越温报告、责任确认、同时越温查询及车次详情一律反映当前窗口，**表态历史保留**并按重建后的责任片段判断有效性。更正与相关读数写入、测温更正、事件和表态在单事务内加锁串行、保持事务一致；成功推进**车次修订号**，使旧装卸预检摘要失效。同更正编号同请求重传返回原结果、异请求冲突；版本过期、原窗口不存在或时段非法均拒绝且不留部分变更。既有登记接口语义保持不变。
+
+责任证据封存（本轮）：调查人员可凭**案件编号**、**货物编号**、**已闭合越温区间标识**及其**当前快照标识**封存责任证据。封存于持货物行锁的单事务内在**一致的已提交视图**上保存该区间**责任片段**、**当时有效表态**，以及重建该区间所用的**自有事件**、**车载读数及其有效温度与版本**（含同刻被自有测温取代、以及**封存时已被生效探头故障隔离**的读数——后者随包保留原始读数、有效温度 / 版本，并标明封存时 `quarantined` / `covering_fault_ids` / `adopted=false`，供核对隔离依据）、**当前装卸窗口及版本**与货物温控参数，并对全部封存内容生成 **SHA-256 内容摘要**；封存内容此后**不可改**。区间消失 / 重开或快照已变时**拒绝且不留记录**；**同案件编号同请求重试即使现况已变仍返回原包**，异请求冲突。`GET` 封存包恒返回**原内容与摘要**；对照现况接口按 `unchanged` / `changed` / `reopened` / `disappeared` 明确区间状态，并逐类列出证据项与责任片段的**增 / 删 / 变更**：封存**后**才被故障隔离的读数沿用 `removed` 语义，封存时**已隔离**读数的后续隔离状态与覆盖故障集合变化（重叠故障撤一条仍隔离、撤最后一条恢复采用）逐项体现；后续晚到记录和测温 / 装卸更正**绝不改写原包**。封存事务的区间定位与证据组装共用**同一次加载、同一次重建**，与故障登记 / 撤销按现有锁序看到一致视图。既有责任确认与更正接口语义保持不变。
+
+车次探头故障与撤销（本轮）：车次探头被证实失准时，质控人员可凭**故障编号**、**车次**、**带时区的起止时刻**与**原因**登记**左闭右开**故障时段（`POST /trips/{trip_id}/probe-faults`）；可凭**撤销编号**与**期望版本**撤销（`POST /trips/{trip_id}/probe-faults/revoke`），登记与撤销均 append-only 留痕、可查（`GET /trips/{trip_id}/probe-faults`）。**任一生效（未撤销）故障覆盖的车载读数不参与货物越温重建，晚到读数也如此**（隔离在重建时按当时生效故障即时判定）；重叠故障撤销一条后，另一条覆盖的读数仍隔离，撤销最后一条覆盖故障后读数按**当前有效温度**恢复采用（**同刻自有测温仍优先，交接不受影响**）。原始读数与温度更正历史照常可查；货物时间线、车次详情标明**隔离状态与覆盖故障**。越温报告、责任确认与车次同时越温结果随之重算；**旧表态历史与已封存证据包保持原样**，封存现况对照反映变化（被隔离读数在对照中记为 removed，原包不改）。故障写入与相关装卸、读数、更正及表态在单事务内按“先货物行升序、再车次行”串行，**成功后推进车次修订号**（旧装卸预检摘要失效；预检读数覆盖 / 风险项附隔离标记）。故障编号同请求重传返回原结果；异内容、版本过期、非法时段或未知车次均拒绝**且不留部分写入**。
+
+货物温度上限分时生效标准（本轮）：质控人员可对单票货物登记**分时生效的温度上限**——提交**货物编号、变更编号、带时区生效时刻、新上限、期望标准版本与原因**（`POST /cargo/{cargo_id}/temp-standards`，`GET …/temp-standards` 返回完整标准历程与当前版本）。货物既有 `temp_upper_limit` 字段仍表示**初始上限**（标准版本 0，自货物起始时刻 `started_at` 生效），登记读数 / 更正接口约定不变；每次变更只追加一行（append-only，不修改不删除），版本为提交序号（首次为 1，乐观锁 `expected_version`）。上限按**左闭右开阶梯函数**分时生效：一笔已采用读数在 t 时刻的越温判定取“生效时刻 ≤ t 的最新一条标准”，**边界读数采用新上限**；**允许补录**（生效时刻早于提交时间）与**预约**（晚于提交时间，当前上限在其生效前不变），**同一生效时刻仅一条**变更，且不得早于 / 等于货物起始时刻（后者属初始版本），否则 `422 before_start` / `standard_initial_slot`，同刻 `409 same_timestamp_conflict`，期望版本过期 `409 stale_version`；**变更本身不产生测温或交接**。货物时间线（每点附当时上限）、越温报告、责任确认及车次同时越温**按每笔已采用读数当时的上限重建**；装卸预检在**标准变更时刻二次分段**分析风险（货物集合不变也分段），预检摘要绑定各涉及货物的**完整标准历程**（补录 / 预约同样使摘要过期，确认时拒绝）；新封存包记录**各证据读数采用的上限**与完整标准历程并计入内容摘要，**既有封存包及摘要恒不变**，现况对照新增标准历程增删（`temp_standard_changes`）并把标准引起的证据上限差异逐项呈现（旧包按“仅初始版本”解释）。并发标准变更与读数、装卸、封存操作经货物行锁保持一致视图；变更编号同请求重传返回原结果，异内容 / 版本过期 / 时刻非法 / 同刻冲突均拒绝且不留部分写入。
+
+测温盲区查询（本轮）：质控人员可按**货物编号、带时区查询起止时刻（左闭右开）与最大允许无有效测温时长**（秒，正数）查看测温盲区（`GET /cargo/{cargo_id}/blind-spots`）。覆盖仅取**查询窗内**该货物的**自有测温**与**读数时刻落在其当前装卸窗口、未被生效探头故障隔离**的车载读数；**同刻自有测温优先**，**温度是否越限不影响覆盖**（测温值更正只改温度，也不改变覆盖）。以查询边界和相邻有效读数时刻划分间隔，**严格长于**阈值的间隔列为盲区；**无有效读数时整窗**按同一规则处理（间隔恰等于阈值不算）。结果按时间升序给出每段起止、时长与**两端读数来源坐标**（自有事件ID / 车载读数ID+车次；该端为查询边界、无相邻读数时为空），并按货物自有**交接时刻**列出各段的**保管方片段**（交接点归接收方，不产生零长度片段）。晚到读数、装卸窗口更正及探头故障登记 / 撤销后均按**当前状态重算，不改任何原记录**。查询只读、基于一致的已提交数据视图（PostgreSQL 下 REPEATABLE READ 快照）；起止非法 / 缺时区 `422 invalid_query_window` / `timezone_required`，阈值缺失 / 非正数或非数字 `422 missing_parameter` / `invalid_gap_threshold`，货物不存在 `404 cargo_not_found`。
+
+亚秒级时刻精度（本轮）：责任区间接受**亚秒级测温与交接时刻**，但此前区间快照、表态片段坐标与封存证据时间被截为整秒——10:00:01.900 的正常读数闭合越温区间后，又补录 10:00:01.100 的正常读数使闭合提前时，边界已变却可能沿用旧快照、旧表态仍被认作有效、封存对照漏报。本轮起，**区间快照标识、表态片段坐标、新封存包及现况对照一律按实际时刻区分亚秒变化**：整秒时刻保持既有标识与时间格式（`YYYY-MM-DDTHH:MM:SSZ`，既有整秒快照标识逐字节不变），含亚秒时追加 6 位微秒（`...SS.ffffffZ`，与 API 响应中亚秒时刻的序列化形态一致）。**历史表态、已封存原包及摘要不可改写**；旧记录只存整秒坐标（精度已丢失），当前区间边界 / 片段 / 证据时刻含亚秒时**无法证实片段仍相同**——旧表态一律判为失效（`is_current=false`），封存对照不得为 `unchanged`（记 `changed`，并经 `segment_changes` / `evidence_changes` 等现有字段逐项呈现整秒旧值与亚秒新值）；当前各时刻均为整秒且与旧记录一致时维持原判定（`unchanged` / 有效，整秒标识与格式不变）。客户端调用路径、字段与错误语义不变。
+同时越温查询分批装配（本轮）：`GET /trips/{trip_id}/simultaneous-excursions` 的**HTTP 路径、请求 / 响应字段与错误语义完全不变**，仅重构服务端数据装配与重建，使其随货物票数增长时仍保持可控往返。此前该查询逐票各自读齐完整上下文（每票多条 SQL，数据库往返随**票数**线性增长），并把相关车次的全部车载读数（含本批货物从不在车时刻的读数）读回；现改为先取本车次在查询终点之前开始的装卸时段得到相关货物集合，再把货物按**可控批次**（批大小默认 100，可用环境变量 `SIMULTANEOUS_CARGO_BATCH_SIZE` 调整）分批，每批以**固定条数的集合查询**（`IN` 批量 + 车载读数对装卸窗口的存在性连接）一次装齐全票上下文——数据库往返随**批次数**（⌈票数/批大小⌉）而非票数增长。每票仍纳入其**跨车次历史**（全部相关车次的装卸时段、对其在车的车载读数、生效探头故障隔离、测温更正有效值与完整温度标准历程），货物从上一车次带着未闭合区间装车时仍自本车次装车时刻起计入；车载读数只装载对批次内某票货物在某个装卸窗口内（左闭右开）在车的行，且统一不读取查询终点之后的事件 / 读数 / 装卸窗口 / 标准变更（左闭右开下这些点不改变查询窗内区间形状），**不加载无关车次数据**。整次查询仍使用**同一已提交快照**（PostgreSQL 下 REPEATABLE READ）；输出沿用现有左闭右开装卸与查询窗裁剪、未闭合区间先被卸货时刻截断再裁至查询终点、同刻自有测温优先、生效故障隔离、有效温度（测温更正）、分时上限、亚秒时刻及货物集合变化分段规则。**无装卸或车上货物数不达 `min_cargo` 门槛时直接返回空结果**（不再装配每票上下文）；非法查询窗、非法门槛与未知车次沿用现有错误（`422 invalid_query_window` / `timezone_required` / `invalid_min_cargo` / `missing_parameter`、`404 trip_not_found`）。批大小不影响结果，仅改变读库分批粒度；应用侧可直接调用 `app.vehicle_crud.query_simultaneous_excursions(db, trip_id, start_at, end_at, min_cargo)`，或经 `app.timeline.load_cargo_contexts_batch(db, cargo_ids, read_before=end_at)` 复用分批上下文装配。
+
+## 一、一键启动（Docker Compose，含数据库初始化）
+
+```bash
+docker compose up --build
+```
+
+启动后：
+
+| 组件 | 地址 |
+| --- | --- |
+| API 服务 | http://localhost:8000 |
+| 交互式接口文档 Swagger UI | http://localhost:8000/docs |
+| ReDoc 文档 | http://localhost:8000/redoc |
+| 健康检查 | http://localhost:8000/health |
+| PostgreSQL | localhost:5432（用户/库/密码默认均为 `coldchain`） |
+
+首次启动时，`db/init.sql` 由 PostgreSQL 官方镜像自动执行（建枚举类型、表、CHECK 约束、部分唯一索引）。应用启动时也会执行 `CREATE TABLE IF NOT EXISTS` 作为兜底。API 容器通过 `depends_on: service_healthy` 等待数据库就绪。
+
+停止与清理：
+
+```bash
+docker compose down          # 停止（保留数据卷）
+docker compose down -v       # 停止并删除数据库数据卷（下次重新初始化）
+```
+
+## 二、本地开发（不走 Docker）
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 需要一个可连接的 PostgreSQL，并先执行 db/init.sql
+export DATABASE_URL="postgresql+psycopg2://coldchain:coldchain@localhost:5432/coldchain"
+uvicorn app.main:app --reload --port 8000
+```
+
+## 三、配置（环境变量）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DATABASE_URL` | `postgresql+psycopg2://coldchain:coldchain@db:5432/coldchain` | SQLAlchemy 数据库连接串（容器内主机名为 `db`） |
+| `POSTGRES_USER` | `coldchain` | 数据库用户（compose） |
+| `POSTGRES_PASSWORD` | `coldchain` | 数据库密码（compose） |
+| `POSTGRES_DB` | `coldchain` | 数据库名（compose） |
+| `API_PORT` | `8000` | 宿主机映射的 API 端口 |
+| `DB_PORT` | `5432` | 宿主机映射的数据库端口 |
+| `SIMULTANEOUS_CARGO_BATCH_SIZE` | `100` | 同时越温查询每批装配的货物票数（正整数；数据库往返随批次数而非票数增长，仅影响读库分批粒度、不改变结果） |
+
+也可在项目根目录放 `.env` 文件供 compose 读取。时间字段统一按 UTC 存储；请求时间建议带时区偏移（如 `+08:00`），无时区时间按 UTC 解释。
+
+## 四、HTTP API
+
+基址：`http://localhost:8000`。所有请求/响应均为 JSON。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/cargo` | 创建货物 |
+| `GET` | `/cargo` | 货物列表 |
+| `GET` | `/cargo/{cargo_id}` | 货物详情（`temp_upper_limit` 恒为初始上限/版本 0） |
+| `POST` | `/cargo/{cargo_id}/temp-standards` | **提交分时温度上限变更**（带时区生效时刻、新上限、期望版本、原因；append-only） |
+| `GET` | `/cargo/{cargo_id}/temp-standards` | **完整标准历程与当前版本**（初始版本 + 历次变更，按生效时刻升序） |
+| `POST` | `/events` | 写入货物**自有**测温 / 交接事件 |
+| `GET` | `/cargo/{cargo_id}/events` | 按发生时间列出**自有事件**（不含车载读数） |
+| `GET` | `/cargo/{cargo_id}/report` | **追责报告**：越温区间（含读数来源）+ 责任片段 |
+| `GET` | `/cargo/{cargo_id}/timeline` | **合并读数时间线**：自有事件 + 适用的车载读数（含被取代点） |
+| `GET` | `/cargo/{cargo_id}/responsibilities` | **责任确认**：全部已闭合区间的确认状态 |
+| `GET` | `/cargo/{cargo_id}/responsibilities/{interval_id}` | 单个已闭合区间的责任确认视图 |
+| `POST` | `/cargo/{cargo_id}/responsibilities/{interval_id}/stances` | 提交责任方表态（确认 / 异议） |
+| `GET` | `/cargo/{cargo_id}/responsibilities/{interval_id}/stances` | 区间历次表态历史（含已改口 / 已失效） |
+| `POST` | `/trips` | 登记车次 |
+| `GET` | `/trips` | 车次列表（含车次修订号） |
+| `GET` | `/trips/{trip_id}` | 车次详情：修订号、装卸时段、车载原始读数及对各货物的适用性 |
+| `POST` | `/trips/{trip_id}/manifest` | 批量登记车次上各票货物的装卸时段（原子） |
+| `POST` | `/trips/{trip_id}/manifest/precheck` | **装卸前温控兼容性预检**（只读，输出各重叠时段分析与预检摘要） |
+| `POST` | `/trips/{trip_id}/manifest/confirm` | **携预检摘要确认登记**装卸时段（摘要过期拒绝；通过后批量原子校验） |
+| `POST` | `/trips/{trip_id}/loading-corrections` | **装卸时段更正**（只改该条窗口；原车次+货物+原装车时刻定位，乐观版本、原因） |
+| `GET` | `/trips/{trip_id}/loading-corrections` | 一条装卸窗口的**原始/当前窗口与历次更正**（按版本升序） |
+| `POST` | `/trips/{trip_id}/probe-faults` | **探头故障登记**（左闭右开带时区时段 + 原因；覆盖读数隔离，不参与越温重建） |
+| `GET` | `/trips/{trip_id}/probe-faults` | 车次探头故障登记列表（含已撤销，登记与撤销均留痕） |
+| `POST` | `/trips/{trip_id}/probe-faults/revoke` | **撤销探头故障**（撤销编号 + 期望版本；撤销最后覆盖故障后读数恢复采用） |
+| `POST` | `/evidence-seals` | **责任证据封存**（案件编号 + 货物 + 已闭合区间标识 + 当前快照标识，生成内容摘要） |
+| `GET` | `/evidence-seals/{case_id}` | 查询**封存包原内容与摘要**（不可改） |
+| `GET` | `/evidence-seals/{case_id}/diff` | 封存包**对照当前现况**：证据项 / 责任片段的增删变更与区间状态 |
+| `POST` | `/vehicle-readings` | 写入车载测温读数（允许晚到；幂等 / 冲突） |
+| `GET` | `/trips/{trip_id}/simultaneous-excursions` | **质控：同一车次多票货物同时越温时段** |
+| `GET` | `/cargo/{cargo_id}/blind-spots` | **质控：货物测温盲区**（带时区查询窗 + 最大允许无有效测温时长，含两端读数来源与保管方片段） |
+| `POST` | `/corrections` | **提交测温值更正**（只改温度；自有测温 / 车载读数） |
+| `GET` | `/events/{event_id}/corrections` | 自有事件的原始测温与**历次更正**（交接为空历史） |
+| `GET` | `/vehicle-readings/{reading_id}/corrections` | 车载读数的原始温度与**历次更正** |
+| `GET` | `/health` | 健康检查 |
+
+### 1. 创建货物 `POST /cargo`
+
+```json
+{
+  "cargo_id": "COLD-001",
+  "started_at": "2026-09-30T08:00:00+08:00",
+  "temp_upper_limit": "4.0",
+  "initial_holder": "北京冷库"
+}
+```
+
+字段：货物编号、起始时间、温度上限（℃）、起始保管方。编号重复返回 `409 cargo_exists`。
+
+> `temp_upper_limit` 恒为货物的**初始温度上限**（标准版本 0，自 `started_at` 生效）；分时标准变更**不修改本字段**，标准历程见下节。
+
+### 1.1 分时温度上限标准 `POST /cargo/{cargo_id}/temp-standards`
+
+质控人员为一票货物登记一笔**分时生效的新温度上限**（append-only，只追加不修改）。
+
+请求：
+
+```json
+{
+  "change_id": "std-chg-1",
+  "effective_at": "2026-10-01T12:00:00+08:00",
+  "new_upper_limit": "3.0",
+  "expected_version": 0,
+  "reason": "气象预警，午间收紧温控标准"
+}
+```
+
+* `effective_at`：**带时区偏移**的生效时刻（缺时区 `422 timezone_required`），**允许补录与预约**；必须严格晚于货物起始时刻（早于 → `422 before_start`，等于 → `422 standard_initial_slot`，货物起始时刻属于初始版本）；同一货物同一生效时刻至多一条（`409 same_timestamp_conflict`）。
+* `new_upper_limit`：新生效上限（℃，千分位存储）。
+* `expected_version`：期望的货物**当前标准版本**（已提交变更数；首次为 0），过期返回 `409 stale_version`。
+* `reason`：非空变更原因。
+* 变更本身**不产生任何测温或交接**；成功回执 `201` 给出变更记录、`version`（= 已提交变更数）与 `new_upper_limit`；同编号同请求重传返回 `200 {"replayed": true, …}`，同编号异内容 `409 change_id_conflict`。
+
+### 1.2 标准历程查询 `GET /cargo/{cargo_id}/temp-standards`
+
+```json
+{
+  "cargo_id": "COLD-001",
+  "started_at": "2026-09-30T00:00:00Z",
+  "initial_temp_upper_limit": "4.000",
+  "current_version": 1,
+  "current_temp_upper_limit": "3.000",
+  "standards": [
+    { "version": 0, "effective_at": "2026-09-30T00:00:00Z",
+      "temp_upper_limit": "4.000", "change_id": null, "reason": null },
+    { "version": 1, "effective_at": "2026-10-01T04:00:00Z",
+      "temp_upper_limit": "3.000", "change_id": "std-chg-1",
+      "reason": "气象预警，午间收紧温控标准" }
+  ]
+}
+```
+
+* `standards` 为完整标准历程，**按生效时刻升序**；补录 / 预约使版本号在序列中可能倒序，但每个 `version` 即提交序号、`current_version` 为已提交变更数（下一次变更的 `expected_version`）。
+* `current_temp_upper_limit` 为查询时刻已到达（含）的最新版本上限；**预约版本尚未生效时不计**。
+* 越温判定口径（左闭阶梯）：一笔已采用读数在 t 时刻取“`effective_at ≤ t` 的最新一条”上限，**恰在生效时刻的读数采用新上限**（`temp > limit` 才算越温，等于不越温）。
+
+### 2. 写入事件 `POST /events`
+
+两种事件由请求字段区分（互斥，不能同时出现）：
+
+测温（含 `temperature`）：
+
+```json
+{ "event_id": "evt-1", "cargo_id": "COLD-001",
+  "occurred_at": "2026-09-30T10:00:00+08:00", "temperature": "8.2" }
+```
+
+交接（含 `giver` 与 `receiver`）：
+
+```json
+{ "event_id": "evt-2", "cargo_id": "COLD-001",
+  "occurred_at": "2026-09-30T12:00:00+08:00",
+  "giver": "北京冷库", "receiver": "上海冷库" }
+```
+
+每个事件都带 **事件ID、货物编号、发生时间**。
+
+### 2.1 登记车次 `POST /trips`
+
+```json
+{ "trip_id": "TRUCK-1", "vehicle_no": "京B-冷888", "note": "京沪冷链班" }
+```
+
+车次编号重复返回 `409 trip_exists`，车次不存在返回 `404 trip_not_found`。
+每个车次维护**修订号** `revision`（初始 0）：该车次的装卸登记、车载读数写入、
+车载读数更正、装卸时段更正与**探头故障登记 / 撤销**成功落库时使其 +1
+（失败回滚不递增）；车次列表 / 详情均返回当前修订号，供装卸前预检的
+“预期车次修订号”使用。
+
+### 2.2 登记装卸时段 `POST /trips/{trip_id}/manifest`
+
+一个车次承载多票货物时，**批量**登记每票货物的装卸时段：
+
+```json
+{
+  "items": [
+    { "cargo_id": "COLD-001",
+      "loaded_at": "2026-09-30T09:00:00+08:00",
+      "unloaded_at": "2026-09-30T18:00:00+08:00" },
+    { "cargo_id": "COLD-002",
+      "loaded_at": "2026-09-30T09:00:00+08:00",
+      "unloaded_at": "2026-09-30T18:00:00+08:00" }
+  ]
+}
+```
+
+* 时段**左闭右开** `[loaded_at, unloaded_at)`，且起点必须**严格早于**终点，否则
+  `422 invalid_loading_window`；
+* 同一货物的装卸时段不得与任意车次的既有时段重叠（首尾相接可以）——重叠即“同货物同时
+  属于两个车次”，返回 `409 loading_overlap`；同批内重叠同样拒绝；
+* 货物或车次不存在分别返回 `404 cargo_not_found` / `404 trip_not_found`；
+* 本接口为**批量原子**操作：任一条非法整批拒绝，**不留任何部分记录**。
+* 登记成功后每条窗口响应带**稳定身份** `origin_loaded_at`（首次登记装车时刻，
+  之后的装卸时段更正以此定位该窗口）与 `window_version`（初始 `0`）；
+  `loaded_at` / `unloaded_at` 始终表示**当前有效窗口**（见 2.10 装卸时段更正）。
+
+### 2.3 写入车载测温读数 `POST /vehicle-readings`
+
+```json
+{
+  "reading_id": "vr-1",
+  "trip_id": "TRUCK-1",
+  "read_at": "2026-09-30T10:00:00+08:00",
+  "temperature": "7.0"
+}
+```
+
+读数是车次探头的**原始读数**，写入**允许晚到**（乱序补录）。回执给出读数时刻仍在车上、
+按各自温度上限受影响的货物：
+
+```json
+{ "reading": { "reading_id": "vr-1", "trip_id": "TRUCK-1",
+               "read_at": "2026-09-30T02:00:00Z", "temperature": "7.000", "…": "…" },
+  "affected_cargo_ids": ["COLD-001"] }
+```
+
+* 读数仅作用于读数时刻仍在**同一车次**车上的货物
+  （`loaded_at ≤ read_at < unloaded_at`，左闭右开），与该货物无关的车次读数不入其时间线；
+* 同车次同一时刻至多一笔读数：冲突 `409 same_timestamp_conflict`；
+* 编号幂等：`reading_id` **同内容**重传返回 `200 {"replayed": true, …}`（仍给出受影响货物），
+  **异内容**返回 `409 reading_id_conflict`，原记录不变；车次不存在 `404 trip_not_found`；
+* 读数时刻车上无货物时读数**仍正常入库**（原始可查），仅 `affected_cargo_ids` 为空。
+
+### 2.4 车次详情 `GET /trips/{trip_id}`
+
+返回车次信息（含当前**修订号** `revision`）、全部装卸时段、本车次**探头故障
+登记**（`faults`，含已撤销；生效故障覆盖的读数隔离），以及车载原始读数；每笔
+读数除原始 `temperature` 外另给 `effective_temperature` / `version`（更正后的
+当前有效温度与版本）、`quarantined` / `covering_fault_ids`（是否被本车次生效
+故障覆盖及覆盖故障编号），并对车次上**每票已登记货物**给出：
+
+| 字段 | 含义 |
+| --- | --- |
+| `on_board` | 读数时刻该货物是否仍在车上（左闭右开边界） |
+| `adopted` | 是否被该货物越温时间线**采用**（在车上且同刻无自有测温） |
+| `over_limit` | 按**该货物自身温度上限**与读数的**当前有效温度**判断是否越温；不在车上时为 `null` |
+| `reason` | `adopted` 已采用 / `not_on_board` 不在车上 / `supplanted_by_own` 同刻有自有测温被取代 / `quarantined` 被生效探头故障覆盖（与同刻自有并存时优先标 `supplanted_by_own`，`covering_fault_ids` 仍给出覆盖故障） |
+
+### 2.5 货物读数时间线 `GET /cargo/{cargo_id}/timeline`
+
+返回该货物的**合并读数时间线**（按时间）：货物自有测温 / 交接，以及对其适用的车载原始读数。
+每个点带 `source`（`own` / `vehicle`）、`event_id` / `reading_id` / `trip_id`、
+`adopted`（车载点同刻被自有测温取代时为 `false`，原始读数仍列出）、
+`changes_holder`（仅自有交接为 `true`——车载读数不改变保管方）、
+`temperature`（测温点为**当前有效温度**，已含更正）与 `version`（有效温度的更正版本，
+0=原始值）；车载点另给 `quarantined` / `covering_fault_ids`（是否被生效探头故障
+覆盖及覆盖故障编号，被覆盖不参与重建但原始点仍列出）。每个**测温点**另给
+`temp_upper_limit`——该读数时刻**当时生效的温度上限**（温度标准分时生效，
+左闭阶梯、边界取新；交接点为 `null`）。
+
+### 2.6 质控：同时越温时段 `GET /trips/{trip_id}/simultaneous-excursions`
+
+同一车次承载多票货物时，查找**同时越温**的时段。查询参数：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `trip_id`（路径） | 是 | 车次编号；未知车次返回 `404 trip_not_found` |
+| `start_at` | 是 | 查询起点（**含**），ISO 8601 且**必须带时区**（如 `2026-09-30T08:00:00+08:00`） |
+| `end_at` | 是 | 查询终点（**不含**，左闭右开），同样必须带时区；不严格晚于起点返回 `422 invalid_query_window` |
+| `min_cargo` | 否 | 数量门槛（正整数，**不小于 2**，缺省 `2`）；非法返回 `422 invalid_min_cargo` |
+
+```bash
+curl -G "http://localhost:8000/trips/TRUCK-1/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00" \
+  --data-urlencode "min_cargo=2"
+```
+
+处理规则：
+
+* 对每票货物按**现有合并时间线**重建越温区间（同刻自有测温优先，车载读数仅对
+  在车货物按各自上限生效），再与该货物在**本车次**的装载时段（左闭右开
+  `[loaded_at, unloaded_at)`）及查询窗相交；货物从上一车次带着未闭合区间装车时，
+  自本车次装车时刻起计入；
+* **未闭合区间**先被卸货时刻截断，再裁剪至查询终点；
+* 同一次查询基于**一致的已提交数据视图**（PostgreSQL 下以 REPEATABLE READ
+  快照事务执行）；晚到读数 / 事件**提交后**的下一次查询即反映新结果；
+* **分批数据装配（本轮）**：先取本车次在查询终点之前开始的装卸时段得到相关货物
+  集合（无装卸或车上货物数不达 `min_cargo` 时直接返回空 `segments`，不再读
+  每票上下文）；货物按 `SIMULTANEOUS_CARGO_BATCH_SIZE`（默认 100）分批，每批以
+  固定条数的集合查询（货物 / 自有事件 / 跨车次装卸 / 车载读数 / 生效故障 /
+  测温更正 / 温度标准各一条 `IN` / 存在性连接查询）一次装齐——**数据库往返按
+  批次而非逐票增长**。每票仍含其**跨车次历史**；车载读数只取对批次内某票货物
+  在某个装卸窗口内在车（左闭右开）的行，并统一跳过查询终点之后的点，**不加载
+  无关车次数据**。批大小不影响结果；
+* 扫描线叠加：**货物集合变化即分段**，相邻且集合相同的片段合并，仅保留越温
+  货物数达到门槛的**正长度**片段；片段按时间升序、互不重叠，货物编号按序排列。
+
+```json
+{
+  "trip_id": "TRUCK-1",
+  "start_at": "2026-09-29T16:00:00Z",
+  "end_at": "2026-09-30T16:00:00Z",
+  "min_cargo": 2,
+  "segments": [
+    {
+      "start": "2026-09-30T02:00:00Z",
+      "end": "2026-09-30T03:00:00Z",
+      "cargo_count": 2,
+      "cargo_ids": ["COLD-CAR-A", "COLD-CAR-Q"]
+    }
+  ]
+}
+```
+
+无任何达门槛片段时返回 `200` 且 `segments` 为空数组（无装卸、或车上不同货物数
+本身少于 `min_cargo` 时亦然，此时服务端不装配每票上下文即早退）。响应时间统一
+为 UTC（`Z`）。
+
+#### 本轮用法：分批装配与可调用示例
+
+HTTP 调用与以往完全相同（批大小是服务端读库细节，不是请求参数）：
+
+```bash
+# 批大小通过服务端环境变量控制（compose / 启动环境），默认 100；
+# 仅改变读库分批粒度，不改变任何响应内容
+SIMULTANEOUS_CARGO_BATCH_SIZE=50 uvicorn app.main:app --port 8000
+
+curl -sS -G "http://localhost:8000/trips/TRUCK-1/simultaneous-excursions" \
+  --data-urlencode "start_at=2026-09-30T00:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-01T00:00:00+08:00" \
+  --data-urlencode "min_cargo=2"
+```
+
+应用侧（进程内）可直接调用查询函数，或单独复用“按批装配上下文”的加载器——
+后者对一批货物只发出固定条数的集合查询，并可用 `read_before` 裁掉查询终点
+之后的数据：
+
+```python
+from datetime import datetime, timezone
+from decimal import Decimal
+
+from app.database import SessionLocal
+from app.models import Cargo
+from app import chain, overlap, timeline, vehicle_crud
+
+db = SessionLocal()
+start = datetime(2026, 9, 30, tzinfo=timezone.utc)
+end = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+# 1) 整查询（同一已提交快照；内部按 SIMULTANEOUS_CARGO_BATCH_SIZE 分批）
+segments = vehicle_crud.query_simultaneous_excursions(
+    db, "TRUCK-1", start, end, min_cargo=2
+)
+for seg in segments:
+    print(seg.start, seg.end, seg.cargo_count, list(seg.cargo_ids))
+
+# 2) 只复用分批上下文装配（每票仍含跨车次历史；车载读数只读对批次货物在车的行）
+contexts = timeline.load_cargo_contexts_batch(
+    db, ["COLD-CAR-A", "COLD-CAR-Q"], read_before=end
+)
+for cargo_id, (events, loadings, readings,
+               (event_eff, reading_eff), quarantine, standards) in contexts.items():
+    points = timeline.adopted_timeline(
+        events, readings, loadings, event_eff, reading_eff, quarantine, standards
+    )
+    cargo = db.get(Cargo, cargo_id)
+    result = chain.rebuild_chain(
+        cargo.initial_holder, Decimal(cargo.temp_upper_limit), points
+    )
+    own_loadings = [l for l in loadings if l.trip_id == "TRUCK-1"]
+    print(cargo_id, overlap.cargo_excursion_windows(
+        result.excursions, own_loadings, start, end))
+db.close()
+```
+
+可直接运行的完整链路示例见 `examples/python_client.py`（同时越温查询段）与
+`examples/curl_examples.sh`（第 29–32 项），其中已包含默认门槛、门槛 3 空结果、
+查询窗裁剪与非法查询窗错误演示。
+
+### 2.16 质控：测温盲区 `GET /cargo/{cargo_id}/blind-spots`
+
+质控人员按**货物编号**、**带时区的查询起止时刻**（左闭右开）与**最大允许无
+有效测温时长**查询该票货物在查询窗内的**测温盲区**——相邻有效测温读数之间
+（或查询边界与相邻读数之间）长时间没有任何可信测温覆盖的间隔。查询参数：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `cargo_id`（路径） | 是 | 货物编号；未知货物返回 `404 cargo_not_found` |
+| `start_at` | 是 | 查询起点（**含**），ISO 8601 且**必须带时区**（如 `2026-10-11T06:00:00+08:00`） |
+| `end_at` | 是 | 查询终点（**不含**，左闭右开），同样必须带时区；不严格晚于起点返回 `422 invalid_query_window` |
+| `max_gap_seconds` | 是 | 最大允许无有效测温时长（**秒，正数**，可为小数，如 `7200` / `90.5`）；缺失 `422 missing_parameter`，为 0 / 负 / 非数 / 无穷 `422 invalid_gap_threshold` |
+
+```bash
+curl -G "http://localhost:8000/cargo/COLD-001/blind-spots" \
+  --data-urlencode "start_at=2026-10-11T06:00:00+08:00" \
+  --data-urlencode "end_at=2026-10-11T20:00:00+08:00" \
+  --data-urlencode "max_gap_seconds=7200"
+```
+
+处理规则：
+
+* **有效读数（覆盖）口径**——仅取查询窗内（`start_at ≤ t < end_at`）下列读数：
+  - 货物**自有测温**事件（交接不是测温、不覆盖）；
+  - **读数时刻落在该货物当前装卸窗口内**（左闭右开
+    `loaded_at ≤ read_at < unloaded_at`：恰在装车时刻纳入、卸车时刻排除）、
+    **未被生效探头故障隔离**的车载读数——与合并时间线 / 越温重建完全同一套
+    适用性与隔离判定；
+  - **同刻自有测温优先**：同刻存在自有测温时，车载读数被取代、不计覆盖；
+    其它车次或窗外装卸时段的读数一律不计；
+  - **温度是否越限不影响覆盖**：越温测温同样覆盖；**测温值更正只改温度、
+    不改读数时刻，故不改变覆盖**（无需关心温度与版本）。
+* **盲区划分**：以**查询边界 + 窗内相邻有效读数时刻**作为切分点，把查询窗
+  划成若干相邻间隔（左闭右开）；间隔长度**严格长于** `max_gap_seconds`
+  （`duration > 阈值`，**等于不算**）才列为盲区；**无任何窗内有效读数时，
+  整段查询窗作为同一个间隔**按同一规则判定（整窗不长于阈值则无盲区）。
+* **两端读数来源**：每个盲区给出 `start_reading` / `end_reading` 坐标——
+  `source`（`own` / `vehicle`）、自有 `event_id` 或车载 `reading_id` +
+  `trip_id`、读数时刻 `at`；该端切分点是查询边界（窗外 / 无相邻读数）时
+  对应字段为 `null`。
+* **保管方片段**：盲区再按货物**自有交接时刻**切分：`[片段起, 交接时刻)`
+  归交出方、**自交接时刻起归接收方**（交接点归接收方），给出各片段起止、
+  时长与保管方；起点之前的交接只用于确定起点现任保管方，恰在终点的交接
+  不切（右端不含），不产生零长度片段；无交接时为单片段。
+* **按当前状态重算、不改原记录**：晚到读数提交后、装卸窗口更正改变适用性
+  后、探头故障登记（隔离）/ 撤销（恢复）后的下一次查询即反映新结果；原始
+  测温 / 读数 / 交接与历次更正、故障留痕均不被修改。
+* 查询只读、不加写锁：PostgreSQL 下以 REPEATABLE READ 快照事务保证同次
+  查询视图一致（SQLite 单连接读天然一致）。
+
+```json
+{
+  "cargo_id": "COLD-001",
+  "start_at": "2026-10-10T22:00:00Z",
+  "end_at": "2026-10-11T12:00:00Z",
+  "max_gap_seconds": 7200.0,
+  "blind_spots": [
+    {
+      "start": "2026-10-11T00:00:00Z",
+      "end": "2026-10-11T04:30:00Z",
+      "duration_seconds": 16200.0,
+      "start_reading": {
+        "at": "2026-10-11T00:00:00Z", "source": "vehicle",
+        "event_id": null, "reading_id": "br-0", "trip_id": "TRUCK-1"
+      },
+      "end_reading": {
+        "at": "2026-10-11T04:30:00Z", "source": "own",
+        "event_id": "be-v", "reading_id": null, "trip_id": null
+      },
+      "custody_pieces": [
+        { "start": "2026-10-11T00:00:00Z", "end": "2026-10-11T04:30:00Z",
+          "duration_seconds": 16200.0, "responsible_party": "北京冷库" }
+      ]
+    },
+    {
+      "start": "2026-10-11T04:30:00Z",
+      "end": "2026-10-11T12:00:00Z",
+      "duration_seconds": 27000.0,
+      "start_reading": {
+        "at": "2026-10-11T04:30:00Z", "source": "own",
+        "event_id": "be-v", "reading_id": null, "trip_id": null
+      },
+      "end_reading": null,
+      "custody_pieces": [
+        { "start": "2026-10-11T04:30:00Z", "end": "2026-10-11T06:00:00Z",
+          "duration_seconds": 5400.0, "responsible_party": "北京冷库" },
+        { "start": "2026-10-11T06:00:00Z", "end": "2026-10-11T12:00:00Z",
+          "duration_seconds": 21600.0, "responsible_party": "上海冷库" }
+      ]
+    }
+  ]
+}
+```
+
+无盲区时返回 `200` 且 `blind_spots` 为空数组。响应时间统一为 UTC（`Z`），
+时长单位均为秒。
+
+### 2.17 亚秒级时刻：快照 / 表态 / 封存对照调用示例
+
+责任区间接受**亚秒级**测温与交接时刻（ISO 8601 小数秒，如
+`2026-10-01T10:00:01.900+08:00`）。区间快照标识、表态片段坐标、新封存包
+与现况对照一律按**实际时刻**区分亚秒变化：整秒时刻保持既有标识与时间格式
+（`YYYY-MM-DDTHH:MM:SSZ`），含亚秒时追加 6 位微秒（`...SS.ffffffZ`）。
+调用路径、请求字段与错误语义与整秒场景完全一致。下面的完整示例演示
+“10:00:01.900 正常读数闭合区间后，补录 10:00:01.100 正常读数使闭合提前”
+时各接口的表现。
+
+```bash
+# 1) 创建货物（上限 5℃）
+curl -sS -X POST http://localhost:8000/cargo -H 'Content-Type: application/json' -d '{
+  "cargo_id": "COLD-SUB-1", "started_at": "2026-10-01T09:00:00+08:00",
+  "temp_upper_limit": "5.0", "initial_holder": "北京冷库"
+}'
+
+# 2) 亚秒测温：10:00:00.500 超限（8.0℃）开启区间
+curl -sS -X POST http://localhost:8000/events -H 'Content-Type: application/json' -d '{
+  "event_id": "evt-sub-open", "cargo_id": "COLD-SUB-1",
+  "occurred_at": "2026-10-01T10:00:00.500+08:00", "temperature": "8.0"
+}'
+
+# 3) 亚秒测温：10:00:01.900 恢复正常（3.0℃），闭合区间
+curl -sS -X POST http://localhost:8000/events -H 'Content-Type: application/json' -d '{
+  "event_id": "evt-sub-close", "cargo_id": "COLD-SUB-1",
+  "occurred_at": "2026-10-01T10:00:01.900+08:00", "temperature": "3.0"
+}'
+
+# 4) 责任确认：区间 end 为 "…T02:00:01.900000Z"（UTC），取 snapshot_id 记为 S1
+curl -sS http://localhost:8000/cargo/COLD-SUB-1/responsibilities
+
+# 5) 北京冷库按 S1 表态确认（201）
+curl -sS -X POST http://localhost:8000/cargo/COLD-SUB-1/responsibilities/evt-sub-open/stances \
+  -H 'Content-Type: application/json' -d '{
+  "snapshot_id": "S1", "responsible_party": "北京冷库",
+  "stance": "confirm", "stance_id": "stance-sub-1"
+}'
+
+# 6) 按 S1 封存证据（201；封存包内区间 end 为 "…T02:00:01.900000Z"）
+curl -sS -X POST http://localhost:8000/evidence-seals -H 'Content-Type: application/json' -d '{
+  "case_id": "CASE-SUB-1", "cargo_id": "COLD-SUB-1",
+  "interval_id": "evt-sub-open", "snapshot_id": "S1"
+}'
+
+# 7) 补录更早的正常读数：10:00:01.100（3.0℃）——区间提前闭合
+curl -sS -X POST http://localhost:8000/events -H 'Content-Type: application/json' -d '{
+  "event_id": "evt-sub-close-early", "cargo_id": "COLD-SUB-1",
+  "occurred_at": "2026-10-01T10:00:01.100+08:00", "temperature": "3.0"
+}'
+
+# 8) 再次查询：end 变为 "…T02:00:01.100000Z"，snapshot_id 变为 S2（≠ S1）
+curl -sS http://localhost:8000/cargo/COLD-SUB-1/responsibilities
+
+# 9) 表态历史：stance-sub-1 的 is_current=false（旧表态失效，历史保留）
+curl -sS http://localhost:8000/cargo/COLD-SUB-1/responsibilities/evt-sub-open/stances
+
+# 10) 封存对照：status=changed，segment_changes 给出
+#     片段终点 "…T02:00:01.900000Z" -> "…T02:00:01.100000Z" 的变化，
+#     evidence_changes.own_events 列出新增的 evt-sub-close-early；
+#     原封存包（GET /evidence-seals/CASE-SUB-1）内容与此后摘要不变
+curl -sS http://localhost:8000/evidence-seals/CASE-SUB-1/diff
+```
+
+第 8 步之后，用旧快照 S1 提交表态或新封存会按既有语义拒绝
+（`409 stale_snapshot`）；以 S2 重新表态 / 另案封存即可。旧记录（亚秒精度
+生效前写入的表态与封存包，只存整秒坐标）对含亚秒的当前区间无法证实片段
+仍相同：旧表态 `is_current=false`、封存对照为 `changed` 并逐项列出整秒
+旧值与亚秒新值；整秒区间上的旧记录维持原判定。
+
+### 2.7 测温值更正 `POST /corrections`
+
+测温录错后提交**只改温度**的更正；测温时刻、货物 / 车次归属与原始编号不变，**交接不可更正**。目标由 `target_type` + `target_id` 指定：
+
+* `target_type="own_event"`、`target_id=`自有**测温事件ID**；
+* `target_type="vehicle_reading"`、`target_id=`**车载读数ID**。
+
+```json
+{
+  "correction_id": "corr-1",
+  "target_type": "own_event",
+  "target_id": "evt-temp-1",
+  "expected_version": 0,
+  "new_temperature": "3.8"
+}
+```
+
+* `correction_id`：客户端指定的更正编号；
+* `expected_version`：提交时目标的**当前更正版本**（首次更正为 `0`，之后取上一次更正回执 / 历史查询中的 `version`）——乐观锁，不一致即拒绝；
+* `new_temperature`：更正后的新温度（℃）。时间不在更正范围内，故无时间字段。
+
+回执（`201`）给出更正记录、更正后的**有效温度与版本**，以及受影响货物：
+
+```json
+{
+  "correction": {
+    "correction_id": "corr-1",
+    "target_type": "own_event",
+    "target_id": "evt-temp-1",
+    "cargo_id": "COLD-001",
+    "trip_id": null,
+    "expected_version": 0,
+    "version": 1,
+    "new_temperature": "3.800",
+    "created_at": "2026-10-02T03:00:00Z"
+  },
+  "effective_temperature": "3.800",
+  "version": 1,
+  "affected_cargo_ids": ["COLD-001"]
+}
+```
+
+处理规则：
+
+* 更正**只改温度**：原测温 / 原读数行永不修改，更正只追加；每个目标维护单调版本，
+  更正后的版本 = `expected_version + 1`；当前有效温度取该目标**最新一条**更正；
+* **自有测温更正**：`affected_cargo_ids` 恒为该测温所属货物；
+* **车载读数更正**：`correction.trip_id` 给出车次，`affected_cargo_ids` 为**读数时刻
+  仍在车上的全部货物**（左闭右开 `loaded_at ≤ read_at < unloaded_at`，可能为空），
+  各货物仍按**各自温度上限**重建越温；
+* **同刻自有测温优先**继续适用：该时刻存在自有测温的货物，车载读数（即使已更正）
+  仍标记被取代、不参与其重建；**装卸时段左闭右开**继续适用；
+* 货物时间线、越温报告（含读数来源与 `veh:<读数ID>` 区间标识）、责任确认与
+  车次同时越温查询全部**按有效温度重建**；区间标识仍由开启读数的原编号决定
+  （自有=事件ID、车载=`veh:<读数ID>`），不因更正换号；
+* **历史表态保留**：更正重建后，区间消失 / 重新开放 / 片段变化使旧表态失效，
+  片段未变化的表态继续有效（表态历史中的 `is_current` 按重建结果重新判定）；
+* **幂等与冲突**：
+  - 原事件 / 原读数按**原内容**重传仍幂等（`temperature` 按原始录入值比对，不看更正值）；
+  - `correction_id` **同内容**（目标类型、目标编号、期望版本、新温度全相同）重传
+    返回 `200 {"replayed": true, …原结果…}`；**异内容** `409 correction_id_conflict`；
+  - `expected_version` 与当前版本不一致 → `409 stale_version`；
+  - 目标不存在：自有事件 `404 event_not_found`、车载读数 `404 reading_not_found`；
+  - 目标是交接 → `422 handover_not_correctable`；`target_type` 非法 / 期望版本为负
+    → `422 bad_correction_shape`；
+  - 以上失败**一律不写任何部分结果**。
+* **串行**：更正与相关写入在单事务内加锁串行——自有更正锁所属货物行；车载更正
+  **先按 cargo_id 升序锁定读数时刻在车的全部货物行、再锁定车次行**（与车载读数
+  写入同一锁顺序），故更正与这些货物的事件写入、责任表态、车次装卸登记 / 读数
+  写入严格串行，版本校验所见必为持锁期间的最新有效温度。
+
+### 2.8 原始记录与历次更正查询
+
+* `GET /events/{event_id}/corrections`：返回该自有事件的原始测温（`original_temperature`）、
+  当前 `effective_temperature` / `version` 与历次更正（按版本升序，append-only）；
+  目标为**交接**时也可查：`version=0`、温度字段为 `null`、`corrections` 为空；
+  事件不存在 → `404 event_not_found`。
+* `GET /vehicle-readings/{reading_id}/corrections`：车载读数的原始温度与历次更正，
+  结构同上；读数不存在 → `404 reading_not_found`。
+
+```json
+{
+  "target_type": "own_event",
+  "target_id": "evt-temp-1",
+  "target_exists": true,
+  "original_temperature": "8.200",
+  "effective_temperature": "3.800",
+  "version": 1,
+  "corrections": [
+    { "correction_id": "corr-1", "target_type": "own_event",
+      "target_id": "evt-temp-1", "cargo_id": "COLD-001", "trip_id": null,
+      "expected_version": 0, "version": 1,
+      "new_temperature": "3.800", "created_at": "…",
+      "original_temperature": "8.200" }
+  ]
+}
+```
+
+此外，原始记录列表 / 详情也直接携带有效值：
+
+* `GET /cargo/{cargo_id}/events` 中每条测温事件除原始 `temperature` 外，另给
+  `effective_temperature` 与 `version`（交接二者为 `null` / `0`）；
+* 车次详情 `GET /trips/{trip_id}` 的每笔车载读数除原始 `temperature` 外，另给
+  `effective_temperature` 与 `version`；`over_limit` 等适用性按有效温度判定；
+* 货物合并时间线 `GET /cargo/{cargo_id}/timeline` 的测温点 `temperature` 为
+  **当前有效温度**（含更正），并带 `version`（被取代的车载点也携带，仅供查阅）。
+
+### 2.9 装卸前温控兼容性预检与确认
+
+登记装卸时段前，可先对一批待装货物做**预检**（只读，不写入任何装卸记录），
+再凭预检摘要**确认登记**。两步均按车次维度进行。
+
+**第一步：预检** `POST /trips/{trip_id}/manifest/precheck`
+
+```json
+{
+  "expected_trip_revision": 2,
+  "items": [
+    { "cargo_id": "COLD-002",
+      "loaded_at": "2026-09-30T09:00:00+08:00",
+      "unloaded_at": "2026-09-30T18:00:00+08:00" }
+  ]
+}
+```
+
+* `expected_trip_revision`：调用方预期的**车次修订号**（先经 `GET /trips/{trip_id}`
+  查询获得）；与车次当前修订号不一致返回 `409 stale_trip_revision`；
+* 时段仍为左闭右开且起点严格早于终点，非法返回 `422 invalid_loading_window`；
+* 车次 / 货物不存在分别返回 `404 trip_not_found` / `404 cargo_not_found`。
+
+预检把“车次既有装卸 ∪ 本批拟登记时段”做扫描线叠加，输出车上货物集合恒定
+的各个时段（非空集合才成段，左闭右开）；**再在任一涉及货物的温度标准
+变更生效时刻二次分段**（货物集合不变也分段——段内各票货物的上限必须
+恒定；恰在边界的车载读数归入右侧新段、按新上限分析）。逐段给出：
+
+| 字段 | 含义 |
+| --- | --- |
+| `cargo_ids` / `proposed_cargo_ids` | 该时段车上货物集合 / 其中来自本批拟登记的货物 |
+| `temp_limit_min` / `temp_limit_max` / `temp_limit_spread` | 集合内各票货物在**段起点当时生效上限**的最小 / 最大 / 极差（同车温控要求差异） |
+| `readings` / `reading_count` | 落在该时段内的车次**既有车载读数**（有效温度 `effective_temperature` 与更正版本 `version`） |
+| `risks` | **潜在越温风险**：时段内既有读数有效温度高于某票货物在**读数时刻当时上限**的（货物 × 读数）组合；`supplanted_by_own=true` 表示该货物在读数时刻有自有测温（同刻自有优先，车载读数实际被取代，仅供参考） |
+
+响应同时返回**预检摘要** `digest`（`sha256:` 前缀）：绑定本批时段内容、车次
+修订号、涉及货物（本批 ∪ 车次既有装卸）的**完整温度标准历程**（初始版本 +
+历次变更；补录 / 预约同样改变指纹）与该车次全部既有读数的
+（编号、时刻、更正版本、有效温度）。预检为只读：不写入装卸记录；整次预检
+基于一致的已提交数据视图（PostgreSQL 下 REPEATABLE READ 快照）。
+
+```json
+{
+  "trip_id": "TRUCK-1",
+  "trip_revision": 2,
+  "digest": "sha256:c9426353…616f7a",
+  "segments": [
+    {
+      "start": "2026-09-30T01:00:00Z",
+      "end": "2026-09-30T10:00:00Z",
+      "cargo_ids": ["COLD-001", "COLD-002"],
+      "proposed_cargo_ids": ["COLD-002"],
+      "cargo_count": 2,
+      "temp_limit_min": "4.000",
+      "temp_limit_max": "8.000",
+      "temp_limit_spread": "4.000",
+      "readings": [
+        { "reading_id": "vr-1", "read_at": "2026-09-30T02:00:00Z",
+          "effective_temperature": "7.000", "version": 0 }
+      ],
+      "reading_count": 1,
+      "risks": [
+        { "cargo_id": "COLD-001", "reading_id": "vr-1",
+          "read_at": "2026-09-30T02:00:00Z",
+          "effective_temperature": "7.000", "temp_upper_limit": "4.000",
+          "supplanted_by_own": false }
+      ]
+    }
+  ]
+}
+```
+
+**第二步：确认登记** `POST /trips/{trip_id}/manifest/confirm`
+
+```json
+{
+  "digest": "sha256:c9426353…616f7a",
+  "items": [
+    { "cargo_id": "COLD-002",
+      "loaded_at": "2026-09-30T09:00:00+08:00",
+      "unloaded_at": "2026-09-30T18:00:00+08:00" }
+  ]
+}
+```
+
+* 服务端在**持锁事务内**（与装卸登记同一锁顺序：先货物行升序、再车次行）
+  按当前数据重算预检摘要：车次修订号、涉及货物温度上限或车载读数版本在
+  预检后发生变化（含本车次新增装卸 / 新增读数 / 读数更正），摘要不一致即
+  返回 `409 stale_precheck_digest`，**不落任何记录**；
+* 摘要对批次内容敏感：挪用到其他货物 / 时段同样视为过期；
+* 摘要通过后**沿用与 `POST /trips/{trip_id}/manifest` 相同的批量原子校验**：
+  任一时段非法（`422 invalid_loading_window`）、同批或跨车次重叠
+  （`409 loading_overlap`）整批拒绝、不留部分记录；
+* 确认成功（`201`）与直接登记一样使车次修订号 +1——同一摘要因此**只能用一次**，
+  重复确认返回 `409 stale_precheck_digest`；
+* 未知车次 / 货物同样返回 `404 trip_not_found` / `404 cargo_not_found`。
+
+直接登记接口 `POST /trips/{trip_id}/manifest` 不受影响，可继续单独使用；
+预检 + 确认是在其之上为“先评估兼容性、再原子落库”提供的两步流程。
+
+### 2.10 装卸时段更正 `POST /trips/{trip_id}/loading-corrections`
+
+装卸时段录错后更正**已有登记中的一条装卸窗口**。更正**只改这一条窗口的时间**——
+车次 / 货物归属与窗口的**稳定身份**（首次登记装车时刻 `origin_loaded_at`）永不改变，
+也不影响同车次其它窗口或其它货物。车次详情与各装卸窗口响应中均给出当前窗口、
+稳定身份 `origin_loaded_at` 与该窗口的更正版本 `window_version`（0=原始）。
+
+```json
+{
+  "correction_id": "lc-1",
+  "cargo_id": "COLD-001",
+  "origin_loaded_at": "2026-09-30T09:00:00+08:00",
+  "expected_version": 0,
+  "new_loaded_at": "2026-09-30T08:00:00+08:00",
+  "new_unloaded_at": "2026-09-30T17:00:00+08:00",
+  "reason": "派车单装卸时刻各录晚 1 小时"
+}
+```
+
+* `correction_id`：客户端指定的更正编号（幂等 / 冲突裁决用）；
+* `cargo_id` + `origin_loaded_at`：与路径上的车次共同定位**原窗口**——
+  `origin_loaded_at` 是该窗口**首次登记时的装车时刻**（稳定身份，不随更正改变，
+  取自车次详情该窗口的 `origin_loaded_at`）；
+* `expected_version`：提交时该窗口的当前更正版本（首次更正为 `0`，随后取车次
+  详情中的 `window_version`）——乐观锁，不一致即拒绝；
+* `new_loaded_at` / `new_unloaded_at`：**修正后的带时区**装卸时刻（必须显式
+  携带时区偏移，否则 `422 timezone_required`）；
+* `reason`：更正原因，必填且非空白。
+
+回执（`201`）给出更正记录（原始窗口、更正前窗口、新窗口、版本与原因）、更正后
+该窗口的**当前窗口**与版本；`affected_cargo_ids` 恒为该窗口所属货物（单元素）：
+
+```json
+{
+  "correction": {
+    "correction_id": "lc-1", "trip_id": "TRUCK-1", "cargo_id": "COLD-001",
+    "origin_loaded_at": "2026-09-30T01:00:00Z",
+    "origin_unloaded_at": "2026-09-30T10:00:00Z",
+    "previous_loaded_at": "2026-09-30T01:00:00Z",
+    "previous_unloaded_at": "2026-09-30T10:00:00Z",
+    "new_loaded_at": "2026-09-30T00:00:00Z",
+    "new_unloaded_at": "2026-09-30T09:00:00Z",
+    "expected_version": 0, "version": 1,
+    "reason": "派车单装卸时刻各录晚 1 小时",
+    "created_at": "2026-10-03T03:00:00Z"
+  },
+  "loaded_at": "2026-09-30T00:00:00Z",
+  "unloaded_at": "2026-09-30T09:00:00Z",
+  "origin_loaded_at": "2026-09-30T01:00:00Z",
+  "origin_unloaded_at": "2026-09-30T10:00:00Z",
+  "version": 1,
+  "affected_cargo_ids": ["COLD-001"]
+}
+```
+
+处理规则：
+
+* **只改当前窗口、身份不变**：原始装卸记录行就地保存当前窗口
+  （`loaded_at` / `unloaded_at`）与 `window_version`，稳定身份列
+  `origin_loaded_at` / `origin_unloaded_at` 永不改变；每次更正只向
+  `loading_correction` **追加一行**（原始窗口、更正前窗口、新窗口、版本、原因）；
+* **新窗口合法性**：仍为左闭右开 `[new_loaded_at, new_unloaded_at)` 且起点严格
+  早于终点，否则 `422 invalid_loading_window`；原因必填非空白；
+* **重叠校验排除自身**：按“同一货物在**任意车次**的当前时段不得重叠”校验，
+  **排除被更正的这条旧窗口本身**（新窗口与自身相同、或仅作平移均不会与自身
+  冲突），首尾相接允许；与其它窗口（含跨车次）重叠 → `409 loading_overlap`，
+  整次拒绝、不留部分变更；
+* **车载读数适用性按当前窗口重算**：`loaded_at ≤ read_at < unloaded_at`
+  （恰在装车时刻纳入、恰在卸车时刻排除）——窗口平移 / 伸缩后，边界两侧的车载
+  读数在“在车 / 已卸货”间重新判定；晚到读数规则、同刻自有测温优先、测温更正
+  后的**有效温度**规则继续适用；
+* **报告 / 责任 / 质控 / 车次详情反映当前窗口**：货物时间线、越温报告（含
+  `veh:<读数ID>` 区间标识）、责任确认、车次同时越温查询与车次详情一律按更正后的
+  当前窗口重建；**历史表态保留**，其当前有效性按重建后的责任片段逐片段判断
+  （区间消失 / 重新开放 / 片段变化即失效，未变化片段继续有效）；
+* **事务一致 + 修订号**：更正与相关读数写入、测温更正、货物事件、责任表态、
+  车次装卸登记在单事务内按统一锁顺序（**先货物行、再车次行**）加锁串行；
+  成功时同事务把**车次修订号 +1**，使此前的装卸**预检摘要失效**；任何校验失败
+  整事务回滚（当前窗口不改、不追加更正、修订号不增、不留部分变更）；
+* **幂等与冲突**：
+  - 同 `correction_id` **同请求**（原身份、期望版本、新窗口、原因全相同）重传
+    返回 `200 {"replayed": true, …原结果…}`；
+  - 同 `correction_id` **异请求** → `409 correction_id_conflict`，原记录不变；
+  - `expected_version` 与当前 `window_version` 不一致 → `409 stale_window_version`；
+  - 原窗口不存在（车次存在但无此稳定身份窗口）→ `404 loading_window_not_found`；
+    车次不存在 → `404 trip_not_found`；
+  - 新时段非法 / 缺时区 / 原因为空 → `422`（`invalid_loading_window` /
+    `timezone_required`）；以上失败一律不留部分结果；
+  - 既有装卸登记接口 `POST /trips/{trip_id}/manifest`（及预检 / 确认）的语义
+    保持不变。
+
+### 2.11 装卸窗口与历次更正查询 `GET /trips/{trip_id}/loading-corrections`
+
+按稳定身份查询一条装卸窗口的**原始 / 当前窗口与历次更正**。查询参数（均必填）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `cargo_id` | 货物编号 |
+| `origin_loaded_at` | 窗口**首次登记装车时刻**（稳定身份），ISO 8601 且**必须带时区** |
+
+```bash
+curl -G "http://localhost:8000/trips/TRUCK-1/loading-corrections" \
+  --data-urlencode "cargo_id=COLD-001" \
+  --data-urlencode "origin_loaded_at=2026-09-30T09:00:00+08:00"
+```
+
+返回 `origin_loaded_at` / `origin_unloaded_at`（原始窗口）、`loaded_at` /
+`unloaded_at`（当前窗口）、当前 `version` 与按版本升序的历次更正 `corrections`
+（每条含原始窗口、更正前窗口、新窗口、版本与原因）。车次存在但无此窗口时返回
+`200` 且 `window_exists=false`、`version=0`、空更正列表；车次不存在返回
+`404 trip_not_found`；缺少 `origin_loaded_at` 返回 `422 missing_parameter`，
+时刻非法 / 无时区返回 `422`。
+
+### 2.12 责任证据封存 `POST /evidence-seals`
+
+调查人员可凭**案件编号**、**货物编号**、**已闭合越温区间标识**及其**当前
+快照标识**封存责任证据。封存于持货物行锁的单事务内、在**一致的已提交视图**
+上保存：
+
+* 区间**责任片段**（区间起止、开启 / 闭合读数来源坐标、当前快照标识）；
+* **当时有效表态**：封存时各责任方最新一条仍对当前快照有效的表态及汇总状态；
+* 重建该区间所用的**自有事件**（不晚于区间闭合时刻的全部测温 / 交接，测温附
+  当前有效温度 `effective_temperature` 与更正版本 `version`，**以及该测温
+  时刻当时采用的温度上限** `temp_upper_limit`——温度标准分时生效，交接为 null）；
+* 重建该区间所用的**车载读数**（区间内对该货物在车适用的读数，左闭右开；
+  附当前有效温度、更正版本，同刻有自有测温被取代的原始读数同样封存并标记
+  `adopted=false`，并记录该读数时刻对本货物**当时采用的温度上限**
+  `temp_upper_limit`）；**封存时已被生效探头故障隔离的读数也同样封存**：
+  `adopted=false`、`quarantined=true` 并给出 `covering_fault_ids`
+  （封存时覆盖该读数的生效故障编号，重叠故障全部列出），原始温度、
+  当前有效温度与版本照常随包保留——隔离读数不参与越温重建，但调查人员
+  可直接从封存包核对“该读数为何不参与重建”的隔离依据（被隔离且同刻有
+  自有测温的读数，`adopted` 仍为 false：同刻自有测温仍优先）；
+* **当前装卸窗口及版本**（与区间时间范围相交的窗口，含稳定身份
+  `origin_loaded_at`、当前窗口与 `window_version`）；
+* **封存时的完整温度标准历程**（`temp_standards`：初始版本 + 历次变更，
+  按生效时刻升序）；
+* 货物温控参数（编号、起始时间、**初始**温度上限、起始保管方）。
+
+封存对上述全部内容取规范化 JSON 的 SHA-256，生成**内容摘要**
+`content_digest`（`sha256:` 前缀）；封存内容（规范化原文与摘要）此后
+**不可改**（append-only，任何接口都不修改 / 不删除）。封存内容中的全部
+时间（区间起止、责任片段、证据时刻、`sealed_at`）按**实际时刻**记录：
+整秒为 `YYYY-MM-DDTHH:MM:SSZ`，含亚秒时为 `...SS.ffffffZ`——亚秒级
+边界同样计入快照标识与内容摘要。
+
+```json
+{
+  "case_id": "CASE-2026-001",
+  "cargo_id": "COLD-001",
+  "interval_id": "evt-temp-1",
+  "snapshot_id": "sha256:836e6b3a…e797e4"
+}
+```
+
+* `case_id`：客户端指定的案件编号（封存包主键）；
+* `interval_id`：已闭合区间稳定标识（自有开启=测温事件ID；车载开启=`veh:<读数ID>`，
+  先经 `GET /cargo/{cargo_id}/responsibilities` 获取）；
+* `snapshot_id`：该区间**当前快照标识**（同上接口返回）。
+
+处理规则：
+
+* **拒绝且不留记录**：
+  - 货物不存在 → `404 cargo_not_found`；区间不存在 → `404 interval_not_found`；
+  - 区间仍开放 → `422 interval_open`；
+  - 提交的快照标识与当前快照不一致（区间边界 / 责任片段已因晚到记录或更正
+    变化）→ `409 stale_snapshot`；
+    以上失败整事务回滚，**不留任何封存记录**。
+* **同案件编号重试（幂等）**：同 `case_id` + 同请求（货物 / 区间 / 快照
+  三元组一致）重传，**即使此后现况已变**（区间消失 / 重开 / 快照变化）也
+  返回**原封存包**：`200 {"replayed": true, "seal": …原包…}`；
+* **异请求冲突**：同 `case_id` + 异请求（不同货物 / 区间 / 快照）→
+  `409 case_id_conflict`，原封存不变；
+* **数据库操作异常后的恢复裁决**：创建事务遭遇 `OperationalError`（SQLite
+  锁等待耗尽 / PG 死锁中止；该异常也可能在 commit 实际落库后才由驱动抛出）
+  时回滚并按案件编号复查，裁决与正常路径**完全一致**——查到的已落库封存
+  必须与本次请求的货物编号 / 区间标识 / 快照标识**三者全部相同**，才返回
+  原封存包（`200 replayed=true`）；任一不同仍报 `409 case_id_conflict`，
+  错误体不回显原封存的任何字段（原封存既不改写也不泄露）；查不到封存时
+  沿既有事务路径整事务重试（成功创建 / 普通重传 / 快照校验等既有契约不变）；
+* 封存与同货物的事件写入、车载读数写入、责任表态、测温更正、装卸登记 /
+  更正，以及相关车次的**探头故障登记 / 撤销**共用统一锁序（先货物行升序、
+  再车次行）：封存事务的区间定位与证据组装只做**一次上下文加载、一次
+  重建**，封存所见即持锁期间的最新一致视图，不会出现“旧快照 + 新隔离
+  状态”的撕裂结果。
+
+回执 `201`（结构见下）：`case_id` / `cargo_id` / `interval_id` /
+`snapshot_id`（封存绑定的快照）/ `sealed_at` / `content_digest` 与 `content`
+（封存内容原文）。
+
+### 2.13 查询封存包 `GET /evidence-seals/{case_id}`
+
+按案件编号返回**原封存内容与内容摘要**：封存内容此后不可改，响应恒为封存
+时刻的原文（片段、表态、自有事件、车载读数有效温度 / 版本 / 封存时隔离
+状态、装卸窗口及版本均为封存时值）。案件不存在 → `404 seal_not_found`。
+
+```json
+{
+  "case_id": "CASE-2026-001",
+  "cargo_id": "COLD-001",
+  "interval_id": "evt-temp-1",
+  "snapshot_id": "sha256:836e6b3a…",
+  "content_digest": "sha256:2f1a…",
+  "sealed_at": "2026-10-03T03:30:00Z",
+  "content": {
+    "case_id": "CASE-2026-001",
+    "sealed_at": "2026-10-03T03:30:00Z",
+    "cargo": { "cargo_id": "COLD-001", "started_at": "…",
+               "temp_upper_limit": "4.000", "initial_holder": "北京冷库" },
+    "interval": {
+      "interval_id": "evt-temp-1",
+      "start": "2026-09-30T02:00:00Z", "end": "2026-09-30T08:00:00Z",
+      "is_open": false,
+      "start_source": "own", "end_source": "vehicle",
+      "start_event_id": "evt-temp-1", "end_event_id": null,
+      "start_reading_id": null, "end_reading_id": "vr-2",
+      "start_trip_id": null, "end_trip_id": "TRUCK-1",
+      "snapshot_id": "sha256:836e6b3a…",
+      "segments": [
+        { "start": "…T02:00:00Z", "end": "…T04:00:00Z", "responsible_party": "北京冷库" },
+        { "start": "…T04:00:00Z", "end": "…T08:00:00Z", "responsible_party": "上海冷库" }
+      ]
+    },
+    "current_valid_stances": [
+      { "stance_id": "stance-bj-1", "responsible_party": "北京冷库",
+        "stance": "confirm", "reason": null,
+        "created_at": "…", "snapshot_id": "sha256:836e6b3a…",
+        "segments": [ { "start": "…", "end": "…", "responsible_party": "北京冷库" } ] }
+    ],
+    "summary": "pending",
+    "own_events": [
+      { "event_id": "evt-temp-1", "event_type": "measurement",
+        "occurred_at": "…", "temperature": "8.200",
+        "effective_temperature": "8.200", "version": 0,
+        "giver": null, "receiver": null }
+    ],
+    "vehicle_readings": [
+      { "reading_id": "vr-2", "trip_id": "TRUCK-1", "read_at": "…",
+        "temperature": "3.100", "effective_temperature": "3.100",
+        "version": 0, "adopted": true,
+        "quarantined": false, "covering_fault_ids": [] }
+    ],
+    "loading_windows": [
+      { "trip_id": "TRUCK-1", "cargo_id": "COLD-001",
+        "origin_loaded_at": "…", "loaded_at": "…", "unloaded_at": "…",
+        "window_version": 0 }
+    ],
+    "content_digest": "sha256:2f1a…"
+  }
+}
+```
+
+### 2.14 封存包对照现况 `GET /evidence-seals/{case_id}/diff`
+
+把封存包与当前数据对照（**只读**，不改写封存原包），给出明确状态：
+
+| `status` | 含义 |
+| --- | --- |
+| `unchanged` | 区间仍存在、已闭合且快照标识与封存时相同（证据项无增删变更） |
+| `changed` | 区间仍闭合但边界 / 责任片段已变（快照不同，含亚秒级边界变化） |
+| `reopened` | 同标识区间当前**已重新开放**（`current_interval.is_open=true`、`end`/`current_snapshot_id` 为 null） |
+| `disappeared` | 同标识区间当前**已消失**（`current_interval=null`） |
+
+时间精度：对照按**实际时刻**（含亚秒）重建当前状态。亚秒精度生效前封存
+的**旧包**只含整秒时间（精度已丢失，原包与摘要不可改写）：当前区间边界 /
+片段 / 证据时刻含亚秒时，旧包整秒坐标无法证实仍相同——快照标识必然不同，
+对照记为 `changed`（不认定为 `unchanged`），并在 `segment_changes` /
+`evidence_changes` 中以整秒旧值对亚秒新值逐项呈现；当前各时刻均为整秒且
+与旧包一致时，快照标识相同，对照仍为 `unchanged`（整秒标识与格式不变）。
+
+响应逐类列出**证据项**的增 / 删 / 变更：
+
+* `evidence_changes.own_events`（键 `event_id`）、
+  `evidence_changes.vehicle_readings`（键 `reading_id`）、
+  `evidence_changes.loading_windows`（键 `trip_id|origin_loaded_at`）；
+  每项给出 `change`（`added` / `removed` / `changed`）、`fields`（变更字段，
+  如测温更正后为 `["effective_temperature","version"]`、窗口更正后含
+  `loaded_at` / `window_version`）与 `sealed` / `current` 新旧值；
+* `segment_changes`：责任片段以**片段起点**为稳定键的增 / 删 / 变更；
+  区间重开时当前末段 `end=null`，区间消失时封存片段全部为 `removed`；
+* 区间消失时证据对照范围自货物起始时间起、上界不限（新的开启点 / 窗口更正
+  可能把适用读数带到封存起点之前），以便逐项定位消失原因。
+
+车载读数的**隔离状态变化**按下列语义对照（封存与当前两侧都保留全部适用
+读数，隔离不使读数从证据集中消失）：
+
+* **封存后才被生效故障覆盖**：封存侧 `quarantined=false`、当前侧
+  `quarantined=true` —— 读数退出越温重建，记为 `removed`（封存包内没有
+  隔离事实可作新旧对照，沿用既有语义；区间通常随之 `changed` /
+  `reopened` / `disappeared`）；
+* **封存时已隔离、当前恢复**（撤销最后一条覆盖故障）：记为 `changed`，
+  字段含 `adopted` / `quarantined` / `covering_fault_ids`；该读数同刻有
+  自有测温时 `adopted` 仍为 `false`（同刻自有测温仍优先），字段仅含
+  `quarantined` / `covering_fault_ids`；
+* **封存时已隔离、当前仍隔离**：覆盖故障集合变化（如重叠故障撤销一条后
+  被另一条继续覆盖）记为 `changed`（字段 `covering_fault_ids`），覆盖
+  集合也相同则无差异；恢复按**当前有效温度**参与重建，期间测温更正的
+  `effective_temperature` / `version` 变化同时列出。
+
+**后续晚到记录和测温 / 装卸更正绝不改写封存原包**：它们只反映在本对照结果与
+当前重建接口中；任何时候 `GET /evidence-seals/{case_id}` 与封存成功回执
+（及幂等重放）返回的内容、摘要完全一致。旧封存包（读数项无
+`quarantined` / `covering_fault_ids` 字段）查询时按未隔离（`false` /
+空列表）解释，对照语义不变。
+
+**温度标准变化**同样只反映在对照结果中：响应另给
+`sealed_temp_standards`（封存时完整标准历程；旧包无该段时按“仅有初始
+版本”给出，取自封存包 cargo 段）、`current_temp_standards`（当前完整
+历程，含补录 / 预约）与 `temp_standard_changes`（以版本号为键的
+added / removed / changed；标准 append-only，封存后提交的变更表现为
+`added`）；标准变化引起的证据差异在 `own_events` / `vehicle_readings`
+中记为 `changed`（字段 `temp_upper_limit` 为各证据读数**当时采用上限**
+的新旧值；旧封存包无该字段时按初始上限解释，封存原文不被补写）。
+区间几何未随标准变化时 `status` 仍为 `unchanged`（快照只取决于区间起止
+与责任片段），标准差异仍逐项列出。
+
+### 2.15 车次探头故障登记与撤销
+
+车次探头被证实失准时，质控人员可登记一个**左闭右开**故障时段
+`[fault_start, fault_end)`；故障与**车次**绑定、与装卸时段无关。任一生效
+（未撤销）故障覆盖的车载读数（读数时刻落在故障时段内）都**不参与货物越温
+重建，晚到读数也如此**——隔离在重建 / 查询时按当时的生效故障即时判定，
+故障登记之后补录的旧时刻读数同样被隔离。
+
+**第一步：登记** `POST /trips/{trip_id}/probe-faults`
+
+```json
+{
+  "fault_id": "pf-20261004-01",
+  "fault_start": "2026-10-04T09:00:00+08:00",
+  "fault_end": "2026-10-04T12:00:00+08:00",
+  "reason": "探头 PF-9 校准漂移，计量院证实失准"
+}
+```
+
+* 起止时刻必须**显式携带时区偏移**（否则 `422 timezone_required`），起点严格
+  早于终点（否则 `422 invalid_fault_window`），原因必填非空白；
+* 车次不存在 → `404 trip_not_found`；
+* 故障编号 `fault_id` 为客户端指定：**同编号同请求**（车次 / 起止 / 原因全
+  相同）重传返回 `200 {"replayed": true, …原结果…}`；**异内容**（含挂到其它
+  车次）→ `409 fault_id_conflict`；
+* 登记成功（`201`）回执给出故障记录、故障时段内的车次读数与时段内在车货物：
+
+```json
+{
+  "fault": {
+    "fault_id": "pf-20261004-01", "trip_id": "TRUCK-1",
+    "fault_start": "2026-10-04T01:00:00Z", "fault_end": "2026-10-04T04:00:00Z",
+    "reason": "探头 PF-9 校准漂移，计量院证实失准",
+    "version": 0, "active": true, "created_at": "…", "revocation": null
+  },
+  "quarantined_reading_ids": ["vr-1"],
+  "affected_cargo_ids": ["COLD-001"]
+}
+```
+
+隔离生效后的重建语义：
+
+* 被覆盖的车载读数对读数时刻在车的货物一律 `adopted=false`，**不参与越温
+  重建**；原始读数与**温度更正历史照常可查**（温度字段始终展示原始值 /
+  当前有效温度与版本）；
+* 货物时间线（`GET /cargo/{id}/timeline`）与车次详情（`GET /trips/{id}`）
+  对被隔离读数标明 `quarantined=true` 与 `covering_fault_ids`（覆盖它的生效
+  故障编号，多条重叠故障全部列出）；车次详情逐货物适用性的 `reason` 增加
+  `quarantined`（同时被同刻自有测温取代时优先标 `supplanted_by_own`，
+  故障信息仍随 `covering_fault_ids` 给出），`over_limit` 仍按当前有效温度
+  计算仅供查阅；
+* **同刻自有测温仍优先**：被隔离时刻货物有自有测温的，以自有值重建，交接
+  只由自有事件改变，**交接不受影响**；
+* 越温报告、责任确认与车次同时越温查询随之**重算**（区间可能消失 / 重开 /
+  边界变化）；**旧表态历史保留**（按重建片段判定 `is_current`），**已封存
+  证据包保持原样**：封存**之后**才登记故障时，被隔离读数在封存现况对照中
+  记为证据项 `removed`、区间状态变为 `changed` / `reopened` /
+  `disappeared`；故障在封存**之前**已登记时，被隔离读数本就随包封存
+  （`quarantined` / `covering_fault_ids`），此后覆盖集合变化（重叠故障
+  撤销一条）或撤销最后一条恢复采用只在对照中记为 `changed`，原包不改；
+* 登记与相关装卸、读数、测温更正及表态在单事务内按统一锁顺序（先货物行
+  升序、再车次行）串行；成功使**车次修订号 +1**，此前的装卸预检摘要失效
+  （预检读数覆盖 / 风险项新增 `quarantined` / `covering_fault_ids` 标记）。
+
+**第二步：撤销** `POST /trips/{trip_id}/probe-faults/revoke`
+
+```json
+{
+  "revocation_id": "rv-20261004-01",
+  "fault_id": "pf-20261004-01",
+  "expected_version": 0
+}
+```
+
+* `expected_version` 为故障当前版本（登记后为 `0`，撤销后为 `1`，取故障
+  查询中的 `version`）——乐观锁，不一致或故障已撤销 →
+  `409 stale_fault_version`；
+* 故障不存在 → `404 probe_fault_not_found`（故障不属于路径车次同样 404）；
+* 撤销编号同请求重传返回 `200 replayed`（即使故障已撤销——重传的就是这次
+  撤销）；异请求 → `409 revocation_id_conflict`；
+* 登记行不删不改，撤销只追加一行（故障 `version` 推进为 1，`active=false`，
+  并附 `revocation` 记录），成功同样使车次修订号 +1；
+* **重叠故障**：撤销一条后，另一条生效故障仍覆盖的读数**继续隔离**；
+  **撤销最后一条覆盖故障**后读数恢复采用，且按**当前有效温度**（含期间的
+  测温更正）参与重建——回执 `restored_reading_ids` 给出恢复的读数，
+  同刻自有测温仍优先；越温报告 / 责任 / 同时越温随之重算，旧表态历史与
+  封存原包不变（封存对照状态随之回到 `unchanged` / `changed`）。
+
+**查询** `GET /trips/{trip_id}/probe-faults`：返回该车次全部故障登记（含已
+撤销），按故障开始时刻升序；车次详情 `GET /trips/{trip_id}` 亦带 `faults`
+列表。车次不存在 → `404 trip_not_found`。
+
+### 3. 追责报告 `GET /cargo/{cargo_id}/report`
+
+```json
+{
+  "cargo_id": "COLD-001",
+  "temp_upper_limit": "4.000",
+  "current_temp_upper_limit": "3.000",
+  "current_version": 1,
+  "current_holder": "广州冷库",
+  "excursions": [
+    {
+      "start": "2026-09-30T02:00:00Z",
+      "end": "2026-09-30T08:00:00Z",
+      "is_open": false,
+      "segments": [
+        { "start": "2026-09-30T02:00:00Z", "end": "2026-09-30T04:00:00Z", "responsible_party": "北京冷库" },
+        { "start": "2026-09-30T04:00:00Z", "end": "2026-09-30T06:00:00Z", "responsible_party": "上海冷库" },
+        { "start": "2026-09-30T06:00:00Z", "end": "2026-09-30T08:00:00Z", "responsible_party": "广州冷库" }
+      ],
+      "interval_id": "evt-temp-1",
+      "start_source": "own",
+      "end_source": "vehicle",
+      "start_reading_id": null,
+      "end_reading_id": "vr-2",
+      "start_trip_id": null,
+      "end_trip_id": "TRUCK-1"
+    }
+  ]
+}
+```
+
+未闭合区间：`end` 为 `null`、`is_open` 为 `true`，最后一个责任片段的 `end` 也是 `null`（未结束）。区间与片段均按时间升序返回。
+
+`temp_upper_limit` 恒为**初始上限**（版本 0）；`current_version` / `current_temp_upper_limit` 给出当前标准版本与当前时刻生效上限（预约版本未生效时不计）。越温区间一律按每笔已采用读数**当时的上限**重建（见规则 21），故同一温度在标准变更前后可能分别为不越温 / 越温。
+
+区间的读数来源字段：
+
+* `interval_id`：区间**稳定标识**——货物自有测温开启=测温事件ID（如 `evt-temp-1`）；
+  **车载读数开启=`veh:<读数ID>`**（如 `veh:vr-1`），供责任查询与表态长期引用；
+* `start_source` / `end_source`：开启 / 闭合读数来源 `own`（自有测温）或 `vehicle`（车载读数）；
+  开放区间无闭合来源；
+* `start_reading_id` / `end_reading_id`（车载时）、`start_trip_id` / `end_trip_id`（所属车次）；
+  自有测温时读数ID字段为 `null`、事件坐标见责任确认视图的 `start_event_id` / `end_event_id`。
+
+### 4. 责任确认 `GET /cargo/{cargo_id}/responsibilities[/{interval_id}]`
+
+围绕**已闭合**越温区间开展责任确认（开放区间不参与）。区间以**稳定区间标识** `interval_id` 定位：货物自有测温开启时等于开启测温事件ID，车载读数开启时为 `veh:<读数ID>`。响应同时给出开启 / 闭合读数来源（自有 / 车载）与事件 / 读数坐标、结束测温事件ID（自有闭合时）、责任片段、**当前快照标识**、各责任方最新一条有效表态与汇总状态。
+
+```json
+{
+  "cargo_id": "COLD-001",
+  "intervals": [
+    {
+      "interval_id": "evt-temp-1",
+      "start_event_id": "evt-temp-1",
+      "end_event_id": "evt-temp-2",
+      "start": "2026-09-30T02:00:00Z",
+      "end": "2026-09-30T08:00:00Z",
+      "snapshot_id": "sha256:836e6b3a…e797e4",
+      "segments": [
+        { "start": "…T02:00:00Z", "end": "…T04:00:00Z", "responsible_party": "北京冷库" },
+        { "start": "…T04:00:00Z", "end": "…T08:00:00Z", "responsible_party": "广州冷库" }
+      ],
+      "latest_stances": [
+        {
+          "stance_id": "stance-bj-1",
+          "responsible_party": "北京冷库",
+          "stance": "confirm",
+          "reason": null,
+          "created_at": "2026-09-30T09:00:00Z",
+          "segments": [ { "start": "…T02:00:00Z", "end": "…T04:00:00Z", "responsible_party": "北京冷库" } ]
+        }
+      ],
+      "summary": "pending"
+    }
+  ]
+}
+```
+
+* **快照标识 `snapshot_id`**：`sha256:` 前缀，对「区间起止 + 责任片段序列」的规范化 JSON 取 SHA-256；边界或责任片段一变，快照标识即变。时间按**实际时刻**参与计算：整秒为 `YYYY-MM-DDTHH:MM:SSZ`（既有整秒快照标识不变），含亚秒时为 `...SS.ffffffZ`——亚秒级边界变化（如闭合时刻从 10:00:01.900 提前到 10:00:01.100）同样改变快照。
+* **汇总状态 `summary`**：`all_confirmed` 全确认（当前片段中每个责任方最新有效表态均为确认）／`has_dispute` 有异议（最新有效表态中存在异议）／`pending` 待确认（尚有责任方未表态且无异议）。
+* 列表接口只返回已闭合区间；直查单个区间时，区间不存在返回 `404 interval_not_found`，区间仍开放返回 `422 interval_open`。
+
+### 5. 提交表态 `POST /cargo/{cargo_id}/responsibilities/{interval_id}/stances`
+
+请求体（货物编号与区间标识在路径上）：
+
+```json
+{
+  "snapshot_id": "sha256:836e6b3a…e797e4",
+  "responsible_party": "上海冷库",
+  "stance": "dispute",
+  "reason": "该时段温控由交出方远程设定，接收方未实际接管",
+  "stance_id": "stance-sh-1"
+}
+```
+
+* `stance`：`confirm` 确认担责；`dispute` 异议——**异议必须同时提供非空 `reason`**，确认不得带理由。
+* `responsible_party` **必须出现在当前责任片段中**，否则 `422 party_not_in_segment`。
+* `snapshot_id` 必须等于提交时的当前快照标识；晚到事件导致区间边界 / 责任片段变化后旧快照被拒：`409 stale_snapshot`。
+* `stance_id` 为客户端指定的表态编号：
+  - **同编号 + 同内容重传**：返回 `200 {"replayed": true, "stance": …原记录…}`（**即使该表态所依据的快照已失效也返回原记录**）；
+  - **同编号 + 异内容**：`409 stance_id_conflict`，原记录不变；
+  - **改口**（确认⇄异议）必须使用**新表态编号**，产生一条新记录；历次表态全部保留。
+* 区间不存在 `404 interval_not_found`、区间仍开放 `422 interval_open`，同样拒绝且不落库。
+* 表态提交与同货物的事件写入在事务中共用货物行锁（`SELECT ... FOR UPDATE`）**串行化**：校验用的快照一定来自持锁期间重建出的最新事件链。
+
+### 6. 表态历史 `GET /cargo/{cargo_id}/responsibilities/{interval_id}/stances`
+
+返回区间的历次表态（按提交时间升序），即使区间当前已不存在或重新开放也可查。每条记录附：
+
+* `is_current`：对**当前**快照是否仍有效——晚到事件重建后，所在责任片段边界 / 责任方发生变化的旧表态为 `false`，片段未变化的继续有效；区间消失 / 重新开放时全部为 `false`。片段坐标按**实际时刻**比较（亚秒级差异即为变化）；亚秒精度生效前写入的旧表态只存整秒坐标（精度已丢失），当前片段含亚秒时无法证实片段仍相同，一律判为 `false`（当前片段均为整秒且与旧记录一致时维持原判定）；
+* `superseded`：是否已被同责任方更新的有效表态改口（新编号表态）。
+
+头部还给出 `interval_exists`、`is_open`、`current_snapshot_id`。
+
+## 五、业务规则
+
+1. **时间合法性**：事件发生时间早于货物起始时间 → `422 before_start`，拒绝。
+2. **越温区间**：
+   - 测温 **高于** 其测温时刻**当时生效的温度上限**（`temp > limit`，等于上限不算越温）开启区间；上限按货物温度标准**分时生效**（规则 21：左闭阶梯，边界读数取新上限）；
+   - 区间内首次 **不超温**（`temp <= 当时上限`）的测温在其测温时刻闭合区间；
+   - 区间内重复超限测温不另开区间；区间外的不超限测温无影响。
+3. **责任拆分**：区间跨越交接时，按交接时刻切分——`[区间起, 交接时刻)` 归交出方，**交接时刻起归接收方**；不产生零长度片段。
+4. **晚到记录**：事件允许乱序写入。每次写入都把候选事件并入既有事件，按发生时间整体重算受影响区间；因此交接、测温可事后补录。
+5. **交接合法性（整体拒绝）**：任何一笔交接的交出方必须等于其发生时刻的保管方；晚到插入若导致此前已存在的交接不再满足该条件，本次写入**整体回滚拒绝，既有结果保持不变**（`422 giver_mismatch`）。
+6. **同刻冲突**：同一货物同一时刻至多一笔测温、至多一笔交接（测温与交接可同刻发生，且测温先于交接处理），冲突 → `409 same_timestamp_conflict`。
+7. **幂等**：同一 `event_id` 重传：内容完全一致（时间按同一时刻归一化比较）返回 `200 {"replayed": true}` 且不重复写入；内容不一致返回 `409 event_id_conflict`，原记录不变。
+8. **并发**：同一货物的写入在事务中以 `SELECT ... FOR UPDATE` 锁定货物行串行化，并由部分唯一索引 / CHECK 约束在数据库层兜底。**责任表态提交与事件写入共用同一把货物行锁**，二者对同一货物严格串行。
+9. **责任确认（仅已闭合区间）**：
+   - 区间标识 = 开启区间的稳定标识：货物自有测温开启=测温事件ID；**车载读数开启=`veh:<reading_id>`**；快照标识由区间起止与责任片段序列的 SHA-256 决定（与读数来源无关，只取决于时间坐标与责任方）；
+   - 表态为只追加记录：同编号同内容重传返回原记录（快照失效亦然），同编号异内容冲突，改口必须用新编号且历次表态保留；
+   - 新表态以当前快照校验（过期拒绝），责任方必须在当前片段中；区间不存在 / 开放均拒绝且不落库；
+   - 晚到事件 / 晚到车载读数重建后：区间标识变化（开启读数被自有测温取代等）、边界或责任片段变化的旧表态失效、未变化片段上的表态继续有效，全部历史仍可查。
+10. **车次与装卸时段**：同一冷链车可承载多票货物；装卸时段左闭右开 `[loaded_at, unloaded_at)` 且起点严格早于终点；同一货物的时段不得跨车次（或同批）重叠，首尾相接允许；登记为批量原子操作，任一非法整批拒绝、不留部分记录。
+11. **车载读数适用性**：车载读数只作用于读数时刻仍在**同一车次**车上的货物（`loaded_at ≤ t < unloaded_at`）；同一读数对不同货物按**各自在该读数时刻当时生效的温度上限**（规则 21）分别判断越温，互不影响；读数不改变任何货物的保管方，保管方只由自有交接改变。
+12. **读数来源优先**：同一时刻货物有自有测温时采用**自有值**，该时刻车载读数对该货物标记为“已取代”、不参与越温重建，但**原始读数仍可查**（车次详情与货物时间线均保留）。
+13. **车载读数晚到与幂等**：读数允许乱序写入，写入后对全部受影响货物的时间线按时刻整体重建；`reading_id` 同内容重传幂等、异内容冲突；同车次同刻至多一笔读数。
+14. **串行一致性**：车载读数写入在单事务内**先按 cargo_id 升序锁定全部受影响货物行、再锁定车次行**，与这些货物的自有事件写入、责任表态严格串行（与装卸登记、同车次读数写入也经车次行锁串行），校验与重建所见必为持锁期间的最新时间线。
+15. **同时越温质控查询**：对车次上每票货物按其合并时间线重建越温区间（规则 11–13 同样适用），先与该车次装卸时段相交（装车前 / 卸货后不计，左闭右开），再与左闭右开查询窗相交；未闭合区间先后被卸货时刻与查询终点截断。货物集合变化即分段，相邻同集合片段合并，仅保留达 `min_cargo`（≥2）门槛的正长度片段。查询只读、不加写锁：PostgreSQL 下以 REPEATABLE READ 快照事务保证同次查询视图一致，晚到读数 / 事件须提交后才会被后续查询看到。**数据装配按可控批次读取（本轮）**：相关货物按 `SIMULTANEOUS_CARGO_BATCH_SIZE`（默认 100）分批，每批以固定条数的集合查询装齐每票的跨车次完整上下文（自有事件、全部相关车次装卸时段、仅对批次货物在车的车载读数、生效故障隔离、测温更正有效值与完整温度标准历程），数据库往返随**批次数**（⌈票数/批大小⌉）而非票数增长；车载读数对装卸窗口做存在性连接、不加载无关车次 / 从不在车时刻 / 查询终点之后的数据；无装卸或车上货物数不达门槛直接空结果；路径、字段、错误语义（`422 invalid_query_window` / `timezone_required` / `invalid_min_cargo` / `missing_parameter`、`404 trip_not_found`）与批大小无关。
+16. **测温值更正**：
+    - 更正**只改温度**：凭目标（自有测温事件ID / 车载读数ID + `target_type`）、更正ID、期望版本与新温度提交；测温时刻、货物 / 车次归属与原编号不变，交接不可更正；
+    - 原始测温 / 读数永不修改，更正只追加；每目标版本单调递增（首次更正后版本 1，新有效温度 = 最新更正的 `new_temperature`；无更正时有效温度 = 原始温度、版本 0）；
+    - 原始记录查询的 `temperature` 恒为原值，另显示 `effective_temperature` / `version`；原始记录及历次更正可查；货物时间线、越温报告、责任确认及车次同时越温查询全部按有效值重建，区间稳定标识仍用原编号（事件ID / `veh:<读数ID>`）；
+    - 同刻自有测温优先、装卸时段左闭右开规则在更正后继续适用；车载读数更正同时影响读数时刻在车的全部货物（按各自上限），同刻有自有测温被取代的货物不受其取值影响；
+    - 原事件 / 读数按原内容重传仍幂等；更正ID同内容（目标 + 期望版本 + 新温度）重传返回原结果、异内容 `correction_id_conflict`；期望版本过期 `stale_version`、目标不存在（`event_not_found` / `reading_not_found`）、目标为交接（`handover_not_correctable`）均拒绝且不落部分结果；
+    - 更正与相关事件、表态及装卸登记串行：自有更正锁货物行，车载更正先按 cargo_id 升序锁在车货物行再锁车次行；历史表态保留，其当前有效性按重建后的责任片段逐片段判断（区间消失 / 开放 / 片段变化即失效，未变化片段继续有效）。
+17. **装卸前预检与确认**：
+    - 车次维护单调递增的**修订号**（初始 0）：该车次的装卸登记、车载读数写入、车载读数更正、**装卸时段更正、探头故障登记 / 撤销**在持车次行锁的同一事务内使其 +1（失败回滚不递增）；车次列表 / 详情返回当前修订号；
+    - 预检只读：输入本批货物与左闭右开装卸时段、预期车次修订号；修订号不一致 `409 stale_trip_revision`，未知车次 / 货物 `404`，非法时段 `422`；输出按“既有装卸 ∪ 本批拟登记”叠加出的各时段货物集合、温度上限差异、既有车载读数覆盖（有效温度与版本）与潜在越温风险（同刻自有测温的货物标记 `supplanted_by_own`），不写入任何装卸记录；
+    - 预检摘要绑定本批时段、车次修订号、涉及货物的**完整温度标准历程**（初始版本 + 历次变更；见规则 21）与车次全部既有读数的（编号、时刻、更正版本、有效温度）；确认在持锁事务内重算摘要，车次、货物温度标准（补录 / 预约变更同样改变指纹）或读数版本任一变化即 `409 stale_precheck_digest` 且不落库；
+    - **在标准变更时刻二次分段**：某票涉及货物的标准生效时刻即使不改变车上货物集合也成为分段边界（恰在边界的读数归入右侧新段、采用新上限）；每段内各票货物上限恒定，段首给出 min / max / 极差，逐笔风险按读数时刻的当时上限判定；
+    - 摘要通过后沿用直接登记的批量原子校验（同批 / 跨车次重叠整批拒绝）；确认成功同样使修订号 +1，同一摘要只能用一次。
+18. **装卸时段更正**：
+    - 装卸时段录错后，凭更正编号、原车次 + 货物 + **首次登记装车时刻**（稳定身份 `origin_loaded_at`）、期望版本 `expected_version`、修正后的**带时区**装卸时刻与原因更正已有登记；更正只改该条装卸窗口的当前时间，车次 / 货物归属与稳定身份永不改变，也不影响其它窗口；
+    - 原始窗口与历次更正 append-only 可查（`GET /trips/{trip_id}/loading-corrections`）；`loading` 行就地保存当前窗口与 `window_version`（0=原始，乐观锁），车次详情展示**当前窗口**、稳定身份与版本；
+    - 新窗口仍左闭右开且起点严格早于终点（否则 `invalid_loading_window`），三个时刻必须带时区（`timezone_required`），原因必填非空白；重叠校验按“同一货物任意车次当前时段不得重叠”进行并**排除该条旧窗口本身**（首尾相接允许），冲突 `loading_overlap` 整次拒绝；
+    - 更正后车载读数适用性按当前窗口重算（`loaded_at ≤ t < unloaded_at`，装车时刻纳入、卸车时刻排除）；晚到读数、同刻自有测温优先与测温更正后有效温度规则继续适用；越温报告、责任确认、同时越温查询与车次详情反映当前窗口；表态历史保留并按重建后的责任片段判断有效性；
+    - 更正与相关读数写入、测温更正、货物事件、责任表态、装卸登记在单事务内按统一锁顺序（先货物行、再车次行）串行；成功使车次修订号 +1（旧装卸预检摘要随之失效），失败整事务回滚、不留部分变更（当前窗口不改、不追加更正、修订号不增）；
+    - 同更正编号同请求（身份 + 期望版本 + 新窗口 + 原因全同）重传返回原结果（`replayed`）、异请求 `correction_id_conflict`；期望版本过期 `stale_window_version`、原窗口不存在 `loading_window_not_found`、车次不存在 `trip_not_found`、时段非法 / 缺时区均拒绝且不落部分结果；既有登记（含预检 / 确认）接口语义不变。
+19. **责任证据封存**：
+    - 调查人员凭**案件编号**（客户端指定，封存包主键）、货物编号、已闭合区间稳定标识与**当前快照标识**封存；封存于持货物行锁的单事务内、在一致的已提交视图上（区间定位与证据组装共用同一次加载 / 重建）保存区间责任片段、当时各责任方最新有效表态与汇总状态、重建该区间所用的自有事件（不晚于闭合时刻的全部事件，测温附有效温度与版本，**另附该测温时刻当时采用的温度上限**）、车载读数（区间内在车适用，附有效温度 / 版本 / `adopted` 与**当时采用的温度上限**，被同刻自有测温取代的原始读数同样封存；**封存时已被生效探头故障隔离的读数也随包封存**，标记 `quarantined` / `covering_fault_ids` 且 `adopted=false`，隔离读数不参与重建但隔离依据可从包内核对）、与区间相交的当前装卸窗口（稳定身份 + 当前窗口 + `window_version`）、**封存时的完整温度标准历程**（初始版本 + 历次变更）及货物温控参数，并对规范化封存内容取 SHA-256 生成 `content_digest`；
+    - 封存内容 append-only、此后不可改（任何接口都不修改 / 不删除）；区间不存在 `interval_not_found` / 货物不存在 `cargo_not_found` / 区间开放 `interval_open` / 快照已变 `stale_snapshot` 一律拒绝，整事务回滚、不留封存记录；
+    - 同案件编号 + 同请求（货物 / 区间 / 快照三元组一致）重试**即使现况已变**（区间消失 / 重开 / 快照变化）也返回原封存包（`200 replayed`）；同案件编号 + 异请求 → `case_id_conflict`，原封存不变；
+    - 创建事务遭遇数据库操作异常（`OperationalError`：锁等待耗尽 / 死锁中止，可能在 commit 落库后才抛出）时，回滚后按案件编号复查并沿用同一裁决：已落库封存与本次货物 / 区间 / 快照**三者全同**才回放原包（`200 replayed`），任一不同仍 `409 case_id_conflict` 且错误体不回显原封存任何字段（不改写、不泄露），查不到封存则整事务重试；成功创建、普通重传与快照校验契约不变；
+    - `GET /evidence-seals/{case_id}` 恒返回原封存内容与摘要；封存包对照现况（只读）返回 `unchanged` / `changed`（仍闭合快照不同）/ `reopened`（明确重开，当前区间 `is_open=true`）/ `disappeared`（明确消失，当前区间为 null），并以稳定键列出自有事件（`event_id`）/ 车载读数（`reading_id`）/ 装卸窗口（`trip_id|origin_loaded_at`）与责任片段（片段起点）的 added / removed / changed（含变更字段与新旧值）；另给出封存时 / 当前的完整温度标准历程与 `temp_standard_changes`（以版本号为键；标准 append-only，封存后变更表现为 added），**标准变化引起的证据当时上限差异**在自有事件 / 车载读数项中记 `changed`（字段 `temp_upper_limit`；旧封存包无该字段，按“仅有初始版本”解释，原包不被补写）；
+    - 后续晚到记录与测温 / 装卸更正只反映在对照结果与当前重建接口中，**绝不改写封存原包**（原包查询、封存回执与幂等重放恒一致）；车载读数隔离状态的对照：封存**后**才被生效故障覆盖的读数记 `removed`（既有语义，对旧封存包同样适用），封存时**已隔离**读数的后续恢复采用（撤销最后一条覆盖故障）记 `changed`（`adopted` / `quarantined` / `covering_fault_ids`，同刻自有仍优先时不含 `adopted`），仍隔离但覆盖集合变化（重叠故障撤销一条）记 `changed`（`covering_fault_ids`），恢复按当前有效温度；封存与同货物的事件 / 读数 / 表态 / 更正 / 装卸写入及相关车次故障登记 / 撤销按统一锁序（先货物行、再车次行）串行看到一致视图；既有责任确认、表态与全部更正接口语义不变。
+20. **车次探头故障与撤销**：
+    - 探头被证实失准后，质控人员凭**故障编号**、车次、**带时区起止时刻**与原因登记左闭右开故障时段；可凭**撤销编号**与**期望版本**撤销；登记（`probe_fault`）与撤销（`probe_fault_revocation`，每故障至多一条）均 append-only 留痕，故障列表与车次详情可查（`active` / `version` / `revocation`）；
+    - **隔离即时生效**：任一生效故障覆盖（`fault_start ≤ read_at < fault_end`）的车载读数不参与在车货物的越温重建，**晚到读数也如此**（按重建时生效故障判定，与读数写入先后无关）；多条重叠故障时覆盖故障编号全部列出，撤销一条后另一条覆盖的读数仍隔离；撤销最后一条覆盖故障后读数按**当前有效温度**恢复采用，**同刻自有测温仍优先、交接不受影响**；
+    - 原始读数与温度更正历史照常可查；货物时间线与车次详情标明 `quarantined` 与 `covering_fault_ids`（适用性 `reason=quarantined`，与同刻自有并存时优先 `supplanted_by_own`）；越温报告、责任确认与车次同时越温随之重算，旧表态历史按重建片段判定有效性、已封存证据包原样保留；封存**之后**才隔离的读数在封存现况对照中列为 `removed` 并给出区间新状态，封存**之时**已隔离的读数随包带有 `quarantined` / `覆盖故障`，其覆盖集合变化与撤销恢复在对照中列为 `changed`（撤销最后一条后随之回到 `unchanged` / `changed`）；预检读数覆盖与风险项附 `quarantined` / `covering_fault_ids` 标记；
+    - 故障写入与相关装卸、读数、测温更正及表态在单事务内按统一锁顺序（先故障时段在车货物行升序、再车次行）串行；成功（登记 / 撤销）使车次修订号 +1，旧装卸预检摘要失效，失败整事务回滚不留部分写入（编号可复用）；
+    - 故障编号同请求（车次 / 起止 / 原因全同）重传返回原结果（`replayed`）、异内容 `fault_id_conflict`；撤销编号同请求重传返回原结果、异请求 `revocation_id_conflict`；期望版本过期 / 故障已撤销 `stale_fault_version`；故障不存在 / 不属于该车次 `probe_fault_not_found`、未知车次 `trip_not_found`；时段起点不严格早于终点 `invalid_fault_window`、缺时区 `timezone_required`、原因为空 `422`。
+21. **货物温度上限分时生效标准**：
+    - 货物初始上限存于 `cargo.temp_upper_limit`（**标准版本 0，自 `started_at` 生效，字段语义永不改变**）；每次标准变更只向 `temp_standard_change` 追加一行（`change_id`、带时区 `effective_at`、`new_upper_limit`、`expected_version`、`version=expected+1`、`reason`），不修改不删除，完整历程由 `GET /cargo/{id}/temp-standards` 返回（按生效时刻升序，含初始版本；`current_version`=已提交变更数）；
+    - 上限为**左闭右开阶梯函数**：已采用读数（自有 / 车载）在 t 时刻取“生效时刻 `≤ t` 的最新一条”上限判定越温，**恰在生效时刻的读数采用新上限**；预约变更在生效时刻到达前不影响任何重建与 `current_temp_upper_limit`，补录变更立即改变全部历史重建（时间线、越温报告、责任确认、车次同时越温、车次读数适用性的 `over_limit` / `temp_upper_limit`），但**测温时刻、归属、读数编号与区间稳定标识均不变**——区间可能因标准变化出现 / 消失 / 重开 / 改变边界，旧表态按规则 9 判定有效性，快照随区间几何变化；
+    - 校验（持货物行锁单事务，失败整次回滚不留部分写入）：货物不存在 `cargo_not_found`；生效时刻缺时区 `timezone_required`；早于货物起始时刻 `before_start`；等于货物起始时刻 `standard_initial_slot`（该时刻属初始版本）；同一货物同一生效时刻至多一条 `same_timestamp_conflict`；`expected_version` 不等于已提交变更数 `stale_version`；原因为空 / 空白 `422`；
+    - 幂等：`change_id` 同请求（货物 + 生效时刻 + 新上限 + 期望版本 + 原因全同）重传返回原结果（`200 replayed`），同编号异内容 `change_id_conflict`；
+    - 标准变更只锁该票货物行，与同货物的事件 / 读数 / 表态 / 测温更正 / 装卸登记及更正 / 证据封存严格串行，看到一致视图；标准变更**不改车次修订号**——对预检摘要的影响经“摘要绑定完整标准历程”体现（补录 / 预约均使旧摘要过期）；
+    - 装卸预检在涉及货物的标准变更时刻把分析时段**二次分段**（货物集合不变也分段；边界读数归右侧新段），段内上限恒定、风险按读数时刻当时上限判定；
+    - 新封存包记录每条证据读数 / 测温当时采用的上限（`temp_upper_limit`）与完整标准历程（`temp_standards`），二者均计入 SHA-256 内容摘要；**既有封存包及其摘要恒不变**（内容中无新字段），现况对照另返回 `sealed_temp_standards` / `current_temp_standards` / `temp_standard_changes`，标准引起的证据上限差异记 `changed`（旧包按仅初始版本解释）；
+    - 既有货物登记、读数与更正（测温 / 装卸）接口约定均保持不变：创建货物仍只给初始上限，读数 / 更正请求不含标准参数。
+22. **测温盲区查询**：
+    - 质控人员凭货物编号 + 带时区查询窗（左闭右开，终点严格晚于起点）+ 最大允许无有效测温时长 `max_gap_seconds`（秒，正有限数，可为小数）查询 `GET /cargo/{cargo_id}/blind-spots`；货物不存在 `cargo_not_found`，缺参 `missing_parameter`，时刻非法 / 无时区 `invalid_query_window` / `timezone_required`，阈值为 0 / 负 / 非数 / 无穷 `invalid_gap_threshold`；
+    - 覆盖只取**查询窗内**的有效测温：货物自有测温，以及读数时刻落在其**当前装卸窗口**（左闭右开，装车时刻纳入、卸车时刻排除）且**未被生效探头故障隔离**的车载读数；同刻有自有测温时车载读数被取代不计，其它车次 / 窗外装卸时段的读数不计；**温度是否越限不影响覆盖**，测温值更正只改温度也不改变覆盖（合并时间线被采用测温点即覆盖点）；
+    - 以查询边界（起点 / 终点）与窗内相邻有效读数时刻为切分点划分间隔，间隔**严格长于**阈值（`duration > max_gap`，等于不算）才列为盲区；无任何窗内有效读数时整窗作为一个间隔按同一规则处理；盲区按时间升序、互不重叠；
+    - 每段给出起止、时长（秒）与两端读数来源坐标（`own`+事件ID 或 `vehicle`+读数ID+车次+读数时刻；该端为查询边界、无相邻读数时为 `null`），并按货物自有交接时刻切分保管方片段：`[片段起, 交接时刻)` 归交出方、自交接时刻起归接收方（交接点归接收方），起点前的交接只确定起点现任方，恰在终点的交接不切，不产生零长度片段，无交接时单片段；
+    - 查询**只读、不改任何原记录**，晚到读数、装卸窗口更正与探头故障登记 / 撤销后按当前状态重算（隔离读数不覆盖、撤销最后一条覆盖故障后恢复覆盖），测温值更正不改变覆盖结果；PostgreSQL 下以 REPEATABLE READ 快照事务保证同次查询视图一致（SQLite 单连接读天然一致）。
+23. **亚秒级时刻精度**：
+    - 测温 / 交接事件与车载读数时刻本就接受亚秒（ISO 8601 小数秒）；区间快照标识、表态片段坐标、新封存包（区间起止 / 片段 / 证据时刻 / `sealed_at`）与现况对照一律按**实际时刻**区分亚秒变化——如 10:00:01.900 闭合的区间因补录 10:00:01.100 的正常读数而提前闭合时，快照标识改变、旧表态失效、封存对照记 `changed` 并逐项列出差异；
+    - 时间格式：整秒时刻保持既有 `YYYY-MM-DDTHH:MM:SSZ`（既有整秒快照标识与封存内容逐字节不变），含亚秒时追加 6 位微秒 `...SS.ffffffZ`（与 API 响应中亚秒时刻的序列化形态一致）；
+    - **历史表态、已封存原包及摘要不可改写**；亚秒精度生效前的旧记录只存整秒坐标（精度已丢失），当前区间边界 / 片段 / 证据时刻含亚秒时无法证实片段仍相同——旧表态一律判为失效（`is_current=false`）、封存对照不得为 `unchanged`（记 `changed`，经 `segment_changes` / `evidence_changes` 等现有字段呈现整秒旧值与亚秒新值）；当前各时刻均为整秒且与旧记录一致时维持原判定（有效 / `unchanged`）；
+    - 客户端调用路径、请求字段与错误语义不变（`stale_snapshot` 等既有拒绝语义对亚秒快照同样适用）。
+24. **同时越温查询分批数据装配（本轮，只读重构）**：
+    - `GET /trips/{trip_id}/simultaneous-excursions` 的调用路径、请求 / 响应字段、裁剪 / 分段输出与错误语义**完全不变**；重构仅限服务端“数据装配与重建”；
+    - 先取本车次 `loaded_at < 查询终点` 的装卸时段（更晚窗口与左闭右开查询窗无正长度交集），得到相关货物集合；**无装卸或车上不同货物数 < `min_cargo` 时直接返回空 `segments`**，只发生车次存在性与装卸两条只读查询，不再装载每票上下文；
+    - 货物按 `SIMULTANEOUS_CARGO_BATCH_SIZE`（正整数，默认 100，非法值回退 100）分批；每批经 `timeline.load_cargo_contexts_batch(db, cargo_ids, read_before=end_at)` 以**固定条数集合查询**装齐：货物行、各票自有事件、各票跨车次装卸时段、车载读数（EXISTS 关联装卸窗口：同车次且 `loaded_at ≤ read_at < unloaded_at`）、读数所属车次的生效故障（隔离映射）、自有 / 车载测温更正最新有效值、完整温度标准历程（初始版本 + 历次变更）。每票仍在内存中按各自装卸窗口与同刻自有优先过滤读数并重建，语义与逐票 `load_cargo_context` 逐点一致；
+    - 数据库往返随**批次数** ⌈票数/批大小⌉ 增长而非随票数线性增长；同批内票数翻倍不增加装配往返；
+    - `read_before=end_at` 统一裁掉 `t ≥ 查询终点` 的事件 / 读数 / 装卸窗口 / 标准变更——左闭右开区间只在测温时刻开启 / 闭合、交接只在其时刻切分责任片段（本查询不输出责任片段），这些点不改变 `[start,end)` 内区间形状，故裁剪与全量加载结果一致，同时不读查询终点之后的数据；
+    - 车载读数经存在性连接只装载**对批次内至少一票货物在车**的行：无关车次、货物全部已卸货 / 未装车时刻的读数不加载；
+    - 整次查询沿用同一已提交快照（首条 SQL 前置 PostgreSQL REPEATABLE READ；SQLite 单连接天然一致），跨批次不会读到不同版本；左闭右开装卸与查询窗裁剪、未闭合区间先卸货截断再裁查询终点、同刻自有测温优先、生效探头故障隔离、有效温度、分时上限（边界取新）、亚秒时刻与货物集合变化分段规则均不变；非法查询窗 / 缺时区 / 非法或缺失门槛 / 未知车次错误码与 HTTP 状态不变。
+
+错误响应统一格式：`{"error": {"code": "...", "message": "..."}}`。
+
+| HTTP | code | 触发场景 |
+| --- | --- | --- |
+| 404 | `cargo_not_found` / `interval_not_found` / `trip_not_found` / `event_not_found` / `reading_not_found` / `loading_window_not_found` / `seal_not_found` / `probe_fault_not_found` | 货物、已闭合区间、车次、更正目标事件或车载读数、被更正装卸窗口、封存证据包（案件编号）、被撤销探头故障（或故障不属于该车次）不存在 |
+| 409 | `cargo_exists` / `trip_exists` / `event_id_conflict` / `same_timestamp_conflict` / `integrity_conflict` / `stance_id_conflict` / `stale_snapshot` / `reading_id_conflict` / `loading_overlap` / `correction_id_conflict` / `stale_version` / `stale_trip_revision` / `stale_precheck_digest` / `stale_window_version` / `case_id_conflict` / `fault_id_conflict` / `revocation_id_conflict` / `stale_fault_version` / `change_id_conflict` | 编号或同刻冲突、表态编号冲突、快照过期（表态 / 封存）、装卸跨车次重叠、更正编号异内容 / 异请求冲突、测温更正 / **温度标准变更**期望版本过期（`stale_version` 同时用于二者）、装卸窗口版本过期、预期车次修订号过期、预检摘要过期、封存案件编号异请求冲突、故障编号异内容冲突、撤销编号异请求冲突、故障期望版本过期（含已撤销再撤销）、**温度标准变更编号异内容冲突** |
+| 422 | `before_start` / `giver_mismatch` / `bad_event_shape` / `interval_open` / `party_not_in_segment` / `bad_stance_shape` / `dispute_reason_required` / `invalid_loading_window` / `reserved_event_id` / `invalid_query_window` / `timezone_required` / `invalid_min_cargo` / `missing_parameter` / `handover_not_correctable` / `bad_correction_shape` / `bad_loading_correction_shape` / `invalid_fault_window` / `standard_initial_slot` / `invalid_gap_threshold` | 业务校验失败（整体拒绝、不落库）；`handover_not_correctable`=交接不可更正，`bad_correction_shape`=测温更正目标类型非法 / 期望版本为负，`bad_loading_correction_shape`=装卸更正定位时刻非法，`invalid_fault_window`=探头故障时段非左闭右开（起点不严格早于终点），`standard_initial_slot`=温度标准变更生效时刻等于货物起始时刻（该时刻属初始版本），`invalid_gap_threshold`=测温盲区查询的最大允许无有效测温时长非正数 / 非数字 / 无穷，`before_start` 同时用于事件早于货物起始与标准变更生效时刻早于货物起始，其余见各项 |
+| 200 | 响应体 `replayed=true` | 事件 / 表态 / 车载读数 / 测温更正 / **温度标准变更**同 ID 同内容幂等重传 |
+
+## 六、调用示例
+
+```bash
+# curl 脚本（演示完整链路 + 幂等 + 报告）
+bash examples/curl_examples.sh
+
+# Python 示例（httpx）
+python examples/python_client.py
+```
+
+或直接打开 http://localhost:8000/docs 使用 Swagger UI 调用。
+
+## 七、测试
+
+```bash
+pip install pytest httpx
+
+pytest -q                                          # 284 个用例（内存库），并发用例自动跳过
+DATABASE_URL="sqlite:////tmp/cc.db" \
+  pytest tests/test_concurrency.py -q              # 10 个并发串行化用例（事件 / 表态 / 车载读数 / 车载测温更正 / 自有测温更正 / 装卸时段更正 / 责任证据封存 / 探头故障 / 封存×故障一致视图 / 温度标准×读数，需文件型库）
+DATABASE_URL="sqlite:////tmp/cc.db" pytest -q      # 文件型 SQLite：294 个用例（含上述并发用例）
+SIMULTANEOUS_CARGO_BATCH_SIZE=2 \
+  pytest tests/test_simultaneous_batching.py -q    # 同时越温分批装配（往返按批次、跨车次等价、不读无关车次、无装卸/不达门槛早退）
+```
+
+测试覆盖：越温开闭、跨交接责任拆分、同刻测温+交接、未闭合区间、晚到重算、交出方整体拒绝、同刻冲突、幂等重传、并发写入串行化，责任确认的快照校验、确认/异议、汇总状态、表态幂等与改口、晚到事件后表态逐片段失效与历史可查；车次登记、装卸时段左闭右开与跨车次重叠整批拒绝、车载读数仅对在车货物按各自上限越温、同刻自有测温优先（车载原始可查）、交接不被车载读数改变、区间稳定标识 `veh:<读数ID>` 与车载区间表态/失效、车载读数晚到重建、车载写入与受影响货物事件写入的并发串行化；质控同时越温查询的集合变化分段、相邻同集合合并、门槛过滤、查询窗与装卸时段裁剪（左闭右开）、未闭合区间裁至查询终点、装车前带入的开放区间自装车时刻起算、同刻自有优先、晚到读数后查询反映新结果、空结果与参数 / 未知车次错误；测温值更正的只改温度（时间 / 归属 / 原编号不变）、版本递增与乐观锁、原始记录保留原值另显示有效温度与版本、历次更正可查、自有 / 车载更正后报告 / 时间线 / 责任确认 / 同时越温按有效值重建、车载更正同时影响在车全部货物、同刻自有优先与左闭右开继续适用、交接不可更正、更正与原记录幂等重传 / 异内容冲突 / 版本过期 / 目标缺失拒绝且不落部分结果、更正后历史表态按重建片段判定有效性、车载 / 自有更正并发串行化；装卸前预检的分段分析（货物集合 / 温度上限差异 / 读数覆盖与有效值 / 潜在越温风险与同刻自有取代标记、左闭右开边界）、预检只读不落库、预期车次修订号校验、未知车次 / 货物与非法时段报错、确认携摘要（通过后沿用批量原子校验、重叠整批拒绝）、摘要过期（装卸登记 / 新增读数 / 读数更正 / 挪用到其他批次 / 重复使用均拒绝且不落库）、车次修订号随装卸登记 / 读数写入 / 读数更正单调递增且失败不递增；以及本轮装卸时段更正的只改该条窗口（车次 / 货物归属与稳定身份不变、其它窗口不动）、原窗口与历次更正 append-only 可追溯、车次详情展示当前窗口 / 稳定身份 / 版本、新窗口左闭右开与必须带时区 / 原因为空拒绝、重叠校验排除自身且跨车次 / 同车次重叠整批拒绝（首尾相接允许）、版本乐观锁（过期 `stale_window_version`）、原窗口不存在 / 车次不存在拒绝、同编号同请求幂等 / 异请求冲突、失败不留部分变更且编号可复用、车载读数适用性按当前窗口重算（装车纳入 / 卸货排除）、越温报告 / 时间线 / 责任确认 / 同时越温反映当前窗口、表态历史保留并按重建片段失效、成功推进车次修订号使旧预检摘要过期、装卸时段更正与事件写入并发串行化；以及本轮责任证据封存的封存内容（区间责任片段与来源坐标、当时有效表态与汇总、自有事件原始 / 有效温度与版本、车载读数有效温度 / 版本 / adopted、当前装卸窗口稳定身份 / 当前窗口 / 版本、货物温控、SHA-256 内容摘要与规范化原文一致）、区间不存在 / 开放 / 快照已变拒绝且不留记录、同案件编号同请求在变化 / 重开 / 消失后仍幂等返回原包、异请求 `case_id_conflict` 且原包不变、封存包查询返回原内容与摘要、现况对照四态（unchanged / changed / reopened / disappeared）与证据项（自有事件 / 车载读数 / 装卸窗口）及责任片段的增删变更（测温更正改有效温度与版本、车载读数更正使区间消失、装卸窗口更正改窗口与版本并按当前窗口重算适用性、被同刻自有测温取代读数标记 adopted=false）、晚到记录与更正绝不改写原包、车载 `veh:` 区间封存、封存与事件写入并发串行化；以及本轮车次探头故障的登记隔离（左闭右开边界、晚到读数隔离、同刻自有仍优先、交接不受影响、读数原始值 / 更正历史可查、时间线与车次详情隔离标记 / 覆盖故障、报告 / 责任 / 同时越温重算）、撤销恢复（重叠故障撤一条另一条继续隔离、撤销最后一条按当前有效温度恢复且同刻自有仍优先、回执恢复读数）、登记与撤销 append-only 留痕、旧表态历史与封存原包不变（失效 / 恢复随重建判定、封存对照 removed / 状态变化、预检隔离标记）、故障 / 撤销编号同请求幂等 / 异内容冲突 / 版本过期 / 非法时段 / 缺时区 / 未知车次 / 非本车次故障拒绝且不留部分写入（失败编号可复用）、故障登记 / 撤销推进车次修订号使旧预检摘要过期、故障登记与车载读数写入并发串行化；以及本轮修复“已登记探头故障下封存归集漏失”：封存时区间内 / 当前装卸窗口内被隔离读数不再漏掉（随包保留原始值 / 有效温度 / 版本，标明 quarantined / covering_fault_ids / adopted=false，同刻自有仍优先）、封存后才隔离读数在对照中沿用 removed 语义、已隔离读数的覆盖集合变化（重叠故障撤一条仍隔离）与撤销最后一条按当前有效温度恢复在对照中记 changed、隔离期间测温更正后恢复按有效温度重建、旧封存包缺省字段按未隔离解释且语义不变、封存事务单次加载单次重建与故障登记 / 撤销按现有锁序看到一致视图（封存×故障并发串行化，撕裂视图不可能封存成功）；以及本轮**货物温度上限分时生效标准**：初始上限恒为版本 0 且 `cargo.temp_upper_limit` 语义不变、标准变更 append-only（提交序号版本与乐观锁、完整历程 / 当前版本 / 当前上限查询）、补录与预约、同刻仅一条且不得早于 / 等于货物起始时刻、边界读数取新上限的左闭阶梯重建（自有测温 / 车载读数 / 时间线逐点当时上限）、标准变化使历史区间出现 / 消失 / 边界变化并驱动表态快照失效与历史保留、车次同时越温按各货当时上限重建、车次详情读数适用性 `over_limit` / `temp_upper_limit` 随标准变化、预检在标准变更时刻二次分段（货物集合不变也切）且风险按读数时刻上限判定、预检摘要绑定完整标准历程（补录 / 预约后确认过期拒绝、标准变更不推进车次修订号）、新封存包记录各证据读数当时上限与完整标准历程（计入内容摘要）、既有封存包与摘要恒不变而现况对照呈现标准历程 added 与证据 `temp_upper_limit` changed（旧包按仅初始版本解释）、同编号同请求幂等 / 异内容冲突 / 版本过期 / 时刻非法 / 同刻冲突拒绝且不留部分写入、标准变更与读数 / 封存并发串行一致；以及本轮**测温盲区查询**：查询边界 + 相邻有效读数时刻划分间隔且严格长于阈值才列盲区（等于不算、无读数整窗判定）、覆盖只取窗内自有测温与当前装卸窗口内未隔离车载读数（左闭右开装车纳入 / 卸货排除、其它车次不计）、同刻自有优先（被取代车载点不覆盖）、越温读数与测温更正不影响覆盖、隔离读数不覆盖而撤销最后覆盖故障后恢复、盲区两端读数来源坐标（自有事件ID / 车载读数ID+车次 / 边界为 null）、按交接时刻切保管方片段（交接点归接收方、起点前交接定现任、恰在终点不切、不产生零长度片段、无交接单片段）、晚到读数 / 装卸窗口更正 / 故障登记撤销后按当前状态重算而测温更正覆盖不变、左闭右开窗（起点读数纳入、终点读数排除）与小数阈值、缺参 / 起止倒置 / 非法时刻 / 缺时区 / 阈值非正非数无穷 / 货物不存在的拒绝；以及本轮**亚秒级时刻精度**：整秒时间格式与既有快照标识逐字节不变、亚秒时刻追加 6 位微秒（`...SS.ffffffZ`）、亚秒级边界变化（10:00:01.900 闭合后补录 10:00:01.100 提前闭合）使快照改变、旧表态失效且新快照可重新表态、新封存包按实际时刻记录亚秒边界与证据时刻、封存对照对亚秒变化记 `changed` 并逐项列出差异、原包与摘要不改写、同案件编号重试仍返回原包、车载读数亚秒闭合与补录提前闭合同样区分、旧表态（整秒截断坐标）对含亚秒区间判 `is_current=false` 而整秒区间上维持有效、旧封存包（整秒时间）对含亚秒当前状态对照为 `changed`（不认定为 `unchanged`）而整秒旧包状态不变时仍为 `unchanged`；以及本轮**同时越温查询分批装配**：批量上下文与逐票上下文重建出的被采用时间线 / 越温区间逐项等价（跨车次开放区间、同刻自有优先、车载读数更正、生效故障隔离、分时上限均覆盖）、车载读数只装载对批次货物在车的行（无关车次 / 已下车时刻 / 查询终点之后的读数不读）、同批票数翻倍不增加装配语句且往返随批大小（批次数）而非票数变化、批大小不改变分段结果、无装卸与车上货物不达门槛时早退空结果（仅车次 + 装卸两条只读查询）。
+
+## 八、目录结构
+
+```
+.
+├── app/
+│   ├── main.py            # FastAPI 路由与异常映射
+│   ├── crud.py            # 自有事件写入事务、幂等、整链校验
+│   ├── correction_crud.py # 测温值更正事务（货物行锁 / 在车货物行锁→车次行锁、版本与幂等）
+│   ├── loading_correction_crud.py # 装卸时段更正事务（货物行锁→车次行锁、窗口版本/重叠排除自身/幂等）
+│   ├── evidence_crud.py   # 责任证据封存事务（货物行锁、单次加载/重建、快照校验、案件编号幂等/冲突、原包查询与对照）
+│   ├── probe_fault_crud.py # 探头故障登记/撤销事务（在车货物行锁→车次行锁、幂等/乐观版本/恢复读数/修订号）
+│   ├── standards.py        # 温度标准历程读取与“当时上限”阶梯解析（左闭、边界取新，纯逻辑）
+│   ├── standard_crud.py    # 温度标准变更事务（货物行锁、提交序号版本/同刻/时刻校验、幂等）
+│   ├── faults.py          # 生效故障读取与隔离判定（覆盖左闭右开、晚到读数即时隔离，纯逻辑）
+│   ├── sealing.py         # 封存证据归集（含隔离读数留痕与各证据当时上限/标准历程）、规范化 JSON / 内容摘要、现况对照（四态、隔离/覆盖集合/标准历程增删变更，纯逻辑）
+│   ├── vehicle_crud.py    # 车次 / 装卸时段 / 车载读数写入事务、装前预检与确认（货物行锁→车次行锁；预检在标准变更时刻分段、摘要绑定标准历程）；同时越温查询按批装配（SIMULTANEOUS_CARGO_BATCH_SIZE，往返随批次数）与无装卸 / 不达门槛早退
+│   ├── stance_crud.py     # 责任表态写入事务（与事件 / 读数 / 标准变更共用货物行锁）
+│   ├── timeline.py        # 合并读数时间线（自有事件 + 适用车载读数，同刻自有优先，含更正有效值，按当前窗口判在车，逐点标注当时温度上限）；同时越温查询的分批上下文装配 load_cargo_contexts_batch（按批集合查询、只读数在车行、裁查询终点之后）
+│   ├── blindspots.py      # 质控测温盲区：查询窗内有效读数（合并时间线被采用测温点）间隔划分 + 严格超阈判定 + 交接保管方片段（纯函数 + 一致快照查询装配）
+│   ├── overlap.py         # 质控同时越温：越温区间 × 装卸时段 × 查询窗求交 + 扫描线分段（纯函数）
+│   ├── precheck.py        # 装前预检：在车窗口扫描线分段、上限差异 / 读数覆盖 / 风险分析与摘要指纹（纯函数）
+│   ├── chain.py           # 保管链重建 / 越温责任拆分（纯函数，含 veh: 区间标识）
+│   ├── responsibility.py  # 快照标识、表态有效性、确认汇总（纯逻辑）
+│   ├── models.py          # SQLAlchemy 模型（货物 / 事件 / 车次 / 装卸[当前窗口+稳定身份+版本] / 车载读数 / 表态 / 测温更正 / 装卸更正 / 探头故障 / 故障撤销 / 责任证据封存 / 温度标准变更）
+│   ├── schemas.py         # Pydantic 请求/响应模型
+│   ├── database.py        # 引擎、Session（含 SQLite 兼容）
+│   └── timeutil.py        # UTC 归一化与规范时间格式（整秒 ...SSZ / 亚秒 ...SS.ffffffZ）
+├── db/init.sql            # PostgreSQL 初始化（枚举、表、约束、索引）
+├── examples/              # curl / Python 调用示例（含车次、车载测温、同时越温查询、测温盲区查询、测温更正、装前预检确认、装卸时段更正、责任证据封存与探头故障登记/撤销完整链路）
+├── tests/                 # pytest 单元 + API + 责任确认 + 车次车载 + 同时越温（含分批装配 / 往返按批次 / 跨车次等价 / 不读无关车次 / 早退）+ 测温盲区 + 测温更正 + 装前预检 + 装卸时段更正 + 责任证据封存 + 探头故障 + 亚秒级时刻精度 + 并发测试
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
