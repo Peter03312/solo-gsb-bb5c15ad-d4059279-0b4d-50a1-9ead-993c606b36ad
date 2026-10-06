@@ -1189,3 +1189,69 @@ curl -sS "$BASE/evidence-seals/$RCASE" | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
 print("       cargo =", d["cargo_id"], "snapshot =", d["snapshot_id"], "digest =", d["content_digest"][:19], "…")'
+
+# ============================================================
+# 本轮修复：车次装卸批量登记 / 携摘要确认登记在数据库操作异常后的
+# 恢复裁决。服务端仅在能确认【本次完整批次已落库、且每条原始装卸
+# 时刻（首次装车 + 首次卸车时刻）都与请求一致】时才按既有结果返回；
+# 否则重放原事务校验——旧窗口重叠仍 409、摘要过期仍 409、部分落库
+# 或其他同刻窗口不得伪装成功；提交后异常的重试不重复登记、不再推进
+# 车次修订号。异常本身由服务端内部处理，客户端可观察契约如下。
+# ============================================================
+MTRIP="TRUCK-RECOVERY-1"; MC="COLD-RECOVERY-1"
+curl -sS -o /dev/null -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$MC\", \"started_at\": \"2026-10-13T06:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\", \"initial_holder\": \"北京冷库\"}"
+curl -sS -o /dev/null -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+  \"trip_id\": \"$MTRIP\", \"vehicle_no\": \"京B-冷666\", \"note\": \"恢复裁决演示班\"}"
+
+echo "82) 装卸登记恢复裁决：同装车时刻的旧窗口不得伪装成新窗口的成功"
+echo "    a) 先登记 08:00-10:00（+08:00）-> 201"
+curl -sS -o /dev/null -w "       登记 08:00-10:00   HTTP %{http_code}\n" \
+  -X POST "$BASE/trips/$MTRIP/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{\"cargo_id\": \"$MC\",
+   \"loaded_at\": \"2026-10-13T08:00:00+08:00\",
+   \"unloaded_at\": \"2026-10-13T10:00:00+08:00\"}]}"
+echo "    b) 同票同装车时刻、不同卸车时刻（08:00-12:00）-> 409 loading_overlap"
+echo "       （即使本次事务在提交前遇数据库异常，恢复裁决也不会把 08:00-10:00"
+echo "        旧窗口当作 08:00-12:00 的成功结果回传，而是重放校验按重叠拒绝）"
+curl -sS -X POST "$BASE/trips/$MTRIP/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{\"cargo_id\": \"$MC\",
+   \"loaded_at\": \"2026-10-13T08:00:00+08:00\",
+   \"unloaded_at\": \"2026-10-13T12:00:00+08:00\"}]
+}" | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("       code =", e["code"])'
+echo "    c) 旧窗口与车次修订号均未被改动（仍只有 08:00-10:00，revision=1）"
+curl -sS "$BASE/trips/$MTRIP" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("       revision =", d["revision"],
+      "loadings =", [(l["loaded_at"], l["unloaded_at"]) for l in d["loadings"]])'
+
+echo "83) 携摘要确认登记同样裁决：预检 12:00-14:00 -> 确认 201 -> 同摘要重确认 409"
+MREV=$(curl -sS "$BASE/trips/$MTRIP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])')
+MDIGEST=$(curl -sS -X POST "$BASE/trips/$MTRIP/manifest/precheck" \
+  -H 'Content-Type: application/json' -d "{
+    \"expected_trip_revision\": $MREV,
+    \"items\": [{\"cargo_id\": \"$MC\",
+     \"loaded_at\": \"2026-10-13T12:00:00+08:00\",
+     \"unloaded_at\": \"2026-10-13T14:00:00+08:00\"}]
+  }" | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')
+curl -sS -o /dev/null -w "       携摘要确认 12:00-14:00  HTTP %{http_code}\n" \
+  -X POST "$BASE/trips/$MTRIP/manifest/confirm" -H 'Content-Type: application/json' -d "{
+  \"digest\": \"$MDIGEST\",
+  \"items\": [{\"cargo_id\": \"$MC\",
+   \"loaded_at\": \"2026-10-13T12:00:00+08:00\",
+   \"unloaded_at\": \"2026-10-13T14:00:00+08:00\"}]}"
+echo "    同一摘要重复确认（确认已使修订号 +1，摘要过期）-> 409 stale_precheck_digest"
+curl -sS -X POST "$BASE/trips/$MTRIP/manifest/confirm" -H 'Content-Type: application/json' -d "{
+  \"digest\": \"$MDIGEST\",
+  \"items\": [{\"cargo_id\": \"$MC\",
+   \"loaded_at\": \"2026-10-13T12:00:00+08:00\",
+   \"unloaded_at\": \"2026-10-13T14:00:00+08:00\"}]
+}" | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("       code =", e["code"])'
+echo "    终态：两条窗口（08:00-10:00、12:00-14:00），revision=2（每次成功登记恰 +1）"
+curl -sS "$BASE/trips/$MTRIP" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("       revision =", d["revision"],
+      "loadings =", [(l["loaded_at"], l["unloaded_at"]) for l in d["loadings"]])'

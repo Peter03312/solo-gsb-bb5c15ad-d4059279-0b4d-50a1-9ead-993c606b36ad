@@ -13,6 +13,14 @@
 （起点不早于终点）或与该货物既有/同批时段重叠（跨车次重叠即“同货物同时
 属于两个车次”），整批拒绝，不留部分记录。
 
+数据库操作异常（``OperationalError``：锁等待耗尽 / 死锁中止，也可能在
+commit 实际落库后才由驱动抛出）后的**恢复裁决**：仅当本批**每一条**拟
+登记窗口的原始装卸时刻（首次装车时刻 + 首次卸车时刻）都与请求完全一致、
+整批无一缺失时，才认定本次批次已落库并按既有结果返回（不重复登记、不再
+推进车次修订号）；任一不符（含部分落库、命中同装车时刻但卸车时刻不同的
+旧窗口）一律重放原事务校验——旧窗口重叠仍按 ``loading_overlap`` 拒绝，
+确认登记的过期摘要仍按 ``stale_precheck_digest`` 拒绝。
+
 车载读数允许晚到；reading_id 同内容重传幂等、异内容冲突；同车次同刻至多
 一笔读数。读数本身不改变任何货物的保管方（交接仍只由货物自有事件产生）。
 
@@ -174,7 +182,8 @@ def register_manifest(db, payload: ManifestCreate):
     except OperationalError:
         # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变。
         # OperationalError 也可能在 commit 已落库后抛出（含车次修订号 +1），
-        # 重放前先检测本批窗口是否已存在，已落库则按既有结果返回，避免重复。
+        # 重放前先按完整批次内容检测本批窗口是否已原样落库，已落库则按既有
+        # 结果返回（不重复登记、不再推进修订号）；否则重放原事务校验。
         db.rollback()
         if _manifest_already_applied(db, payload):
             return _manifest_existing_result(db, payload)
@@ -197,30 +206,46 @@ def confirm_manifest(db, payload: ManifestConfirmCreate):
 
 
 def _manifest_already_applied(db, payload) -> bool:
-    """commit 后 OperationalError 重放检测：本批窗口是否已全部落库。"""
+    """commit 后 OperationalError 重放检测：本批窗口是否已**按请求原样**全部落库。
+
+    仅凭（车次、货物、首次装车时刻）命中不足以认定本次批次已提交——可能
+    命中的只是此前登记的“同装车时刻、不同卸车时刻”的旧窗口。必须本批
+    **每一条**拟登记窗口的原始装卸时刻（``origin_loaded_at`` 与
+    ``origin_unloaded_at``）都与请求完全一致（整批无一缺失、部分落库或
+    其他同刻窗口均不算），才能按既有结果返回；任一不符即返回 False，由
+    调用方重放原事务校验——旧窗口重叠仍按 ``loading_overlap`` 拒绝，
+    预检摘要过期仍按 ``stale_precheck_digest`` 拒绝。
+    """
+    if not payload.items:
+        return False
     for it in payload.items:
         loaded_at = ensure_utc(it.loaded_at)
+        unloaded_at = ensure_utc(it.unloaded_at)
         exists = db.scalars(
             select(Loading).where(
                 Loading.trip_id == payload.trip_id,
                 Loading.cargo_id == it.cargo_id,
                 Loading.origin_loaded_at == loaded_at,
+                Loading.origin_unloaded_at == unloaded_at,
             )
         ).first()
         if exists is None:
             return False
-    return bool(payload.items)
+    return True
 
 
 def _manifest_existing_result(db, payload) -> ManifestResult:
+    """本批已原样落库时的既有结果：按完整原始窗口逐条取回（不重复登记）。"""
     rows = []
     for it in payload.items:
         loaded_at = ensure_utc(it.loaded_at)
+        unloaded_at = ensure_utc(it.unloaded_at)
         row = db.scalars(
             select(Loading).where(
                 Loading.trip_id == payload.trip_id,
                 Loading.cargo_id == it.cargo_id,
                 Loading.origin_loaded_at == loaded_at,
+                Loading.origin_unloaded_at == unloaded_at,
             )
         ).first()
         row.loaded_at = ensure_utc(row.loaded_at)
