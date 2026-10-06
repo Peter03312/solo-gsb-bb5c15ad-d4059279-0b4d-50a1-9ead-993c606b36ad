@@ -13,6 +13,15 @@
 （起点不早于终点）或与该货物既有/同批时段重叠（跨车次重叠即“同货物同时
 属于两个车次”），整批拒绝，不留部分记录。
 
+数据库操作异常（``OperationalError``：锁等待耗尽 / 死锁中止，也可能在
+commit 已落库后才由驱动抛出）后的**恢复裁决**：回滚后严格确认“本次完整
+批次已整体落库，且每条窗口的原始装车/卸车时刻都与本次请求逐条一致”才按
+成功回放；仅装车时刻相同的旧窗口 / 其他同刻窗口、部分落库或摘要过期均不
+得伪装成功——一律沿原事务整事务重试，由既有校验按原语义拒绝（旧窗口重叠
+仍 ``loading_overlap``、预检摘要过期仍 ``stale_precheck_digest``）。确认
+为提交后异常的回放不重新执行写入，故不会重复登记、也不会再次推进车次修订
+号。
+
 车载读数允许晚到；reading_id 同内容重传幂等、异内容冲突；同车次同刻至多
 一笔读数。读数本身不改变任何货物的保管方（交接仍只由货物自有事件产生）。
 
@@ -173,11 +182,17 @@ def register_manifest(db, payload: ManifestCreate):
         return _register_manifest_tx(db, payload)
     except OperationalError:
         # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变。
-        # OperationalError 也可能在 commit 已落库后抛出（含车次修订号 +1），
-        # 重放前先检测本批窗口是否已存在，已落库则按既有结果返回，避免重复。
+        # 但 OperationalError 既可能在**提交前**抛出（事务已中止、整批未落库），
+        # 也可能在 commit **已落库后**抛出（驱动层面的连接/提交异常）。二者无法
+        # 从异常本身区分，故回滚后先做严格的“整批已落库”裁决，见
+        # _find_committed_manifest：仅当本次完整批次的**每条**窗口都能按本次请求
+        # 的原始装车/卸车时刻逐一对上时，才按成功回放；否则沿原事务整事务重试
+        # ——重试会重新执行全部既有校验：旧窗口重叠仍按 loading_overlap 拒绝，
+        # 不会重复登记、也不会再次推进车次修订号。
         db.rollback()
-        if _manifest_already_applied(db, payload):
-            return _manifest_existing_result(db, payload)
+        committed = _find_committed_manifest(db, payload)
+        if committed is not None:
+            return committed
         return _register_manifest_tx(db, payload)
 
 
@@ -190,32 +205,47 @@ def confirm_manifest(db, payload: ManifestConfirmCreate):
     try:
         return _register_manifest_tx(db, payload, expected_digest=payload.digest)
     except OperationalError:
+        # 恢复裁决与直接登记完全相同（见 register_manifest）。额外注意：若本批
+        # 实际未落库，重试在持锁事务内重算摘要——预检后车次/货物/读数版本已变
+        # 时，摘要过期仍按 stale_precheck_digest 拒绝，不得因恢复路径而放行；
+        # 唯有“本次完整批次确已随**本摘要**落库”才回放成功。
         db.rollback()
-        if _manifest_already_applied(db, payload):
-            return _manifest_existing_result(db, payload)
+        committed = _find_committed_manifest(db, payload)
+        if committed is not None:
+            return committed
         return _register_manifest_tx(db, payload, expected_digest=payload.digest)
 
 
-def _manifest_already_applied(db, payload) -> bool:
-    """commit 后 OperationalError 重放检测：本批窗口是否已全部落库。"""
+def _find_committed_manifest(db, payload) -> ManifestResult | None:
+    """``OperationalError`` 后的“整批已落库”严格裁决。
+
+    仅当能够确认**本次完整批次已整体落库**、且每条窗口的**原始装卸时刻**
+    （稳定身份 ``origin_loaded_at`` 与首次登记的原始卸车时刻
+    ``origin_unloaded_at``）都与本次请求逐条一致时，返回成功结果；其他一切
+    情形返回 ``None``，由调用方沿原事务整事务重试。
+
+    判定规则：
+
+    * 按每条请求项的（车次、货物、首次装车时刻）定位窗口；任一条不存在即
+      可能是提交前失败 / 部分落库 → ``None``（重试）。
+    * 定位到的窗口其**原始卸车时刻**必须等于请求卸车时刻。仅装车时刻相同
+      （如旧窗口 08:00-10:00，本次请求 08:00-12:00）属于另一笔窗口 / 其他
+      同刻窗口，不得伪装成功 → ``None``，交由重试按既有冲突语义拒绝。
+    * 请求内（车次、货物、装车时刻）不得重复，且命中间数必须等于请求条数：
+      防止批内重复项被同一行“凑齐”、或部分落库被误判为整批成功。
+    """
+    if not payload.items:
+        return None
+    rows: list[Loading] = []
+    seen: set[tuple] = set()
     for it in payload.items:
         loaded_at = ensure_utc(it.loaded_at)
-        exists = db.scalars(
-            select(Loading).where(
-                Loading.trip_id == payload.trip_id,
-                Loading.cargo_id == it.cargo_id,
-                Loading.origin_loaded_at == loaded_at,
-            )
-        ).first()
-        if exists is None:
-            return False
-    return bool(payload.items)
-
-
-def _manifest_existing_result(db, payload) -> ManifestResult:
-    rows = []
-    for it in payload.items:
-        loaded_at = ensure_utc(it.loaded_at)
+        unloaded_at = ensure_utc(it.unloaded_at)
+        identity = (payload.trip_id, it.cargo_id, loaded_at)
+        if identity in seen:
+            # 批内同身份重复项：整批不可能是一次合法落库的结果
+            return None
+        seen.add(identity)
         row = db.scalars(
             select(Loading).where(
                 Loading.trip_id == payload.trip_id,
@@ -223,10 +253,21 @@ def _manifest_existing_result(db, payload) -> ManifestResult:
                 Loading.origin_loaded_at == loaded_at,
             )
         ).first()
+        # 缺条（提交前失败 / 部分落库）或原始卸车时刻不一致（其他同刻窗口、
+        # 旧窗口只与本次装车时刻相同）：均不得按本批成功回放。
+        if row is None or ensure_utc(row.origin_unloaded_at) != unloaded_at:
+            return None
+        rows.append(row)
+    return _manifest_result_from_rows(payload.trip_id, rows)
+
+
+def _manifest_result_from_rows(trip_id: str, rows: list[Loading]) -> ManifestResult:
+    items = []
+    for row in rows:
         row.loaded_at = ensure_utc(row.loaded_at)
         row.unloaded_at = ensure_utc(row.unloaded_at)
-        rows.append(row)
-    return ManifestResult(trip_id=payload.trip_id, items=rows)
+        items.append(row)
+    return ManifestResult(trip_id=trip_id, items=items)
 
 
 def _register_manifest_tx(

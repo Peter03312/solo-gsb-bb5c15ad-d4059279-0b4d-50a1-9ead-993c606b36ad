@@ -1189,3 +1189,75 @@ curl -sS "$BASE/evidence-seals/$RCASE" | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
 print("       cargo =", d["cargo_id"], "snapshot =", d["snapshot_id"], "digest =", d["content_digest"][:19], "…")'
+
+# ============================================================
+# 本轮：车次装卸批量登记在数据库操作异常（OperationalError，可能在 commit
+# 落库后才由驱动抛出）后的恢复裁决。可观察的 HTTP 契约与正常路径一致：
+#   - 同票同首次装车时刻但卸车时刻不同、且与既有窗口重叠 -> 409 loading_overlap
+#     （恢复路径重试原事务后得到的也是这一拒绝，绝不会回传旧窗口当成功）；
+#   - 完整批次确实已落库且每条原始装卸时刻一致 -> 201（回放，不重复登记、
+#     车次修订号不重复 +1）；
+#   - 携预检摘要确认时摘要过期 -> 409 stale_precheck_digest。
+# 异常注入（提交前死锁中止 / commit 后驱动报错）无法用 curl 制造，完整的
+# 四种恢复场景可运行示例见：python3 examples/manifest_recovery_demo.py
+# ============================================================
+MRTRIP="TRUCK-MR-1"; MRC="COLD-MR-1"; MRC2="COLD-MR-2"
+for CC in "$MRC" "$MRC2"; do
+  curl -sS -o /dev/null -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+    \"cargo_id\": \"$CC\", \"started_at\": \"2026-10-13T00:00:00+08:00\",
+    \"temp_upper_limit\": \"4\", \"initial_holder\": \"甲冷库\"}"
+done
+curl -sS -o /dev/null -X POST "$BASE/trips" -H 'Content-Type: application/json' -d \
+  "{\"trip_id\": \"$MRTRIP\", \"vehicle_no\": \"京M-冷001\"}"
+
+echo "82) 装卸登记恢复裁决的可观察 HTTP 契约（异常注入版见 manifest_recovery_demo.py）"
+echo "    a) 先登记旧窗口 08:00-10:00 -> 201"
+curl -sS -o /dev/null -w "       旧窗口 08:00-10:00      HTTP %{http_code}\n" \
+  -X POST "$BASE/trips/$MRTRIP/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{\"cargo_id\": \"$MRC\",
+    \"loaded_at\": \"2026-10-13T08:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-13T10:00:00+08:00\"}]}"
+MRREV=$(curl -sS "$BASE/trips/$MRTRIP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])')
+echo "    b) 同票再请 08:00-12:00（与旧窗口重叠）-> 409 loading_overlap；"
+echo "       数据库操作异常后恢复重试得到的也是该拒绝，旧窗口不会被回传为成功"
+curl -sS -X POST "$BASE/trips/$MRTRIP/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{\"cargo_id\": \"$MRC\",
+    \"loaded_at\": \"2026-10-13T08:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-13T12:00:00+08:00\"}]
+}" | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("       code =", e["code"])'
+curl -sS "$BASE/trips/$MRTRIP" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("       库内窗口 =", [(l["cargo_id"], l["loaded_at"][11:16], l["unloaded_at"][11:16]) for l in d["loadings"]],
+      "revision =", d["revision"])'
+echo "    c) 不冲突的新批次（另一票 11:00-13:00，首尾相接允许）-> 201"
+curl -sS -X POST "$BASE/trips/$MRTRIP/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{\"cargo_id\": \"$MRC2\",
+    \"loaded_at\": \"2026-10-13T10:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-13T13:00:00+08:00\"}]
+}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("       落库窗口 =", [(i["cargo_id"], i["loaded_at"][11:16], i["unloaded_at"][11:16]) for i in d["items"]])'
+curl -sS "$BASE/trips/$MRTRIP" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+print("       总窗口数 =", len(d["loadings"]), "revision =", d["revision"], "(每次成功登记仅 +1)")'
+echo "    d) 携预检摘要确认：预检后新增车载读数使摘要过期 -> 409 stale_precheck_digest"
+MRREV=$(curl -sS "$BASE/trips/$MRTRIP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])')
+MRDIG=$(curl -sS -X POST "$BASE/trips/$MRTRIP/manifest/precheck" \
+  -H 'Content-Type: application/json' -d "{
+  \"expected_trip_revision\": $MRREV,
+  \"items\": [{\"cargo_id\": \"$MRC2\",
+    \"loaded_at\": \"2026-10-13T14:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-13T16:00:00+08:00\"}]
+}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')
+curl -sS -o /dev/null -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"vr-mr-1\", \"trip_id\": \"$MRTRIP\",
+  \"read_at\": \"2026-10-13T12:00:00+08:00\", \"temperature\": \"7.0\"}"
+curl -sS -X POST "$BASE/trips/$MRTRIP/manifest/confirm" \
+  -H 'Content-Type: application/json' -d "{
+  \"digest\": \"$MRDIG\",
+  \"items\": [{\"cargo_id\": \"$MRC2\",
+    \"loaded_at\": \"2026-10-13T14:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-13T16:00:00+08:00\"}]
+}" | python3 -c 'import json,sys; e=json.load(sys.stdin)["error"]; print("       code =", e["code"])'
+echo "    e) 提交前中止 / commit 落库后报错等异常注入的完整恢复四场景："
+echo "       python3 examples/manifest_recovery_demo.py"
